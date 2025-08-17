@@ -28,6 +28,7 @@ impl GpuModule {
             .unwrap();
 
         let adapter_info = adapter.get_info();
+
         println!("Using adapter: {}", adapter_info.name);
 
         let (device, queue) = adapter
@@ -51,13 +52,13 @@ impl GpuModule {
         let mut shader_manager = ShaderManager::new();
         shader_manager.load_templates()?;
 
-        Ok(Self {
+        return Ok(Self {
             adapter,
             device,
             queue,
             info,
             shader_manager,
-        })
+        });
     }
 
     pub async fn binary_op(
@@ -206,6 +207,7 @@ impl GpuModule {
                 label: Some("Compute Pass"),
                 timestamp_writes: None,
             });
+
             compute_pass.set_pipeline(&compute_pipeline);
             compute_pass.set_bind_group(0, &bind_group, &[]);
 
@@ -241,6 +243,7 @@ impl GpuModule {
 
         let buffer_slice = staging_buffer.slice(..);
         let (sender, receiver) = flume::bounded(1);
+
         buffer_slice.map_async(wgpu::MapMode::Read, move |v| {
             sender.send(v).unwrap();
         });
@@ -249,6 +252,7 @@ impl GpuModule {
             self.device
                 .poll(wgpu::PollType::Wait)
                 .expect("Failed to poll device");
+
             if let Ok(result) = receiver.try_recv() {
                 result.unwrap();
                 break;
@@ -260,9 +264,10 @@ impl GpuModule {
         let output_data: Vec<f32> = result.iter().map(|x| x.value).collect();
 
         drop(data);
+
         staging_buffer.unmap();
 
-        Ok(Tensor::new(output_data, output_shape))
+        return Ok(Tensor::new(output_data, output_shape));
     }
 
     pub fn print_info(&self) {

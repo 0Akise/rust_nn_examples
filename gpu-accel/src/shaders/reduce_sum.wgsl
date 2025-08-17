@@ -31,11 +31,12 @@ fn main(
         if (tid < stride) {
             shared_data[tid] = shared_data[tid] + shared_data[tid + stride];
         }
+
         workgroupBarrier();
+        
         stride = stride / 2u;
     }
     
-    // Write result
     if (tid == 0u) {
         output[group_id.x].value = shared_data[0];
     }

@@ -17,13 +17,16 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     
     if (row < M && col < P) {
         var sum = 0.0;
+
         for (var k = 0u; k < N; k++) {
             let a_idx = row * N + k;
             let b_idx = k * P + col;
+
             sum += input_a[a_idx].value * input_b[b_idx].value;
         }
         
         let output_idx = row * P + col;
+        
         output[output_idx].value = sum;
     }
 }

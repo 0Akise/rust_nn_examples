@@ -24,6 +24,7 @@ fn get_broadcasted_index(flat_idx: u32, shape: array<u32, 4>, rank: u32) -> u32 
     for (var i = 0u; i < rank; i++) {
         let dim_idx = rank - 1u - i;
         let coord = remaining % shape[dim_idx];
+        
         result += coord * stride;
         remaining = remaining / shape[dim_idx];
         stride *= shape[dim_idx];

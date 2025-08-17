@@ -1,0 +1,16 @@
+[package]
+name = "nn-examples"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+gpu-accel = { path = "../gpu-accel" }
+pollster = { workspace = true }
+
+[[bin]]
+name = "tensor_ops"
+path = "src/tensorops.rs"
+
+[[bin]]
+name = "matrix_ops"
+path = "src/matrix_operations.rs"

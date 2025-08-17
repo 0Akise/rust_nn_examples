@@ -3,6 +3,9 @@ pub mod shader_manager;
 
 use bytemuck::{Pod, Zeroable};
 
+pub use gpu_module::GpuModule;
+pub use shader_manager::{ShaderManager, ShaderTemplate};
+
 #[derive(Debug, Clone)]
 pub struct GpuInfo {
     pub name: String,
@@ -93,4 +96,50 @@ pub enum Operation {
     MatrixMultiply,
     Transpose,
     Reduce(ReduceOp),
+}
+
+pub struct GpuSession {
+    gpu: GpuModule,
+}
+
+impl GpuSession {
+    pub async fn new() -> Result<Self, Box<dyn std::error::Error>> {
+        return Ok(Self {
+            gpu: GpuModule::new().await?,
+        });
+    }
+
+    pub async fn matmul(
+        &mut self,
+        a: &Tensor,
+        b: &Tensor,
+    ) -> Result<Tensor, Box<dyn std::error::Error>> {
+        return self.gpu.binary_op(a, b, Operation::MatrixMultiply).await;
+    }
+
+    pub async fn add(
+        &mut self,
+        a: &Tensor,
+        b: &Tensor,
+    ) -> Result<Tensor, Box<dyn std::error::Error>> {
+        return self.gpu.binary_op(a, b, Operation::ElementWiseAdd).await;
+    }
+
+    pub async fn multiply(
+        &mut self,
+        a: &Tensor,
+        b: &Tensor,
+    ) -> Result<Tensor, Box<dyn std::error::Error>> {
+        return self
+            .gpu
+            .binary_op(a, b, Operation::ElementWiseMultiply)
+            .await;
+    }
+
+    pub async fn batch_operations<F, R>(&mut self, operations: F) -> R
+    where
+        F: FnOnce(&mut GpuModule) -> R,
+    {
+        return operations(&mut self.gpu);
+    }
 }

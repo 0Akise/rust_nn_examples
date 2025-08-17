@@ -16,6 +16,7 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     if (row < ROWS && col < COLS) {
         let input_idx = row * COLS + col;
         let output_idx = col * ROWS + row;
+        
         output[output_idx].value = input[input_idx].value;
     }
 }

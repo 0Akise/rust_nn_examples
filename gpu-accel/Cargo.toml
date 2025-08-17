@@ -1,0 +1,13 @@
+[package]
+name = "gpu-accel"
+version = "0.1.0"
+edition = "2021"
+description = "simple GPU Backbone for examples"
+
+[dependencies]
+wgpu = { workspace = true }
+bytemuck = { workspace = true, features = ["derive"] }
+flume = { workspace = true }
+
+[dev-dependencies]
+pollster = { workspace = true }

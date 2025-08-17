@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::fs;
 
 use super::{Operation, Shape};
 
@@ -44,17 +43,17 @@ impl ShaderManager {
     pub fn load_templates(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         self.template_cache.insert(
             Operation::ElementWiseMultiply,
-            fs::read_to_string("src/shaders/elementwise_multiply.wgsl")?,
+            include_str!("shaders/elementwise_multiply.wgsl").to_string(),
         );
 
         self.template_cache.insert(
             Operation::ElementWiseAdd,
-            fs::read_to_string("src/shaders/elementwise_add.wgsl")?,
+            include_str!("shaders/elementwise_add.wgsl").to_string(),
         );
 
         self.template_cache.insert(
             Operation::MatrixMultiply,
-            fs::read_to_string("src/shaders/matrix_multiply.wgsl")?,
+            include_str!("shaders/matrix_multiply.wgsl").to_string(),
         );
 
         Ok(())
