@@ -460,44 +460,4 @@ impl GpuModule {
         println!("  Type: {}", self.info.device_type);
         println!("  Backend: {}", self.info.backend);
     }
-
-    fn create_bind_group_layout(&self) -> wgpu::BindGroupLayout {
-        todo!("Implement bind group layout creation")
-    }
-
-    fn create_bind_group(
-        &self,
-        layout: &wgpu::BindGroupLayout,
-        input_a: &wgpu::Buffer,
-        input_b: &wgpu::Buffer,
-        output: &wgpu::Buffer,
-    ) -> wgpu::BindGroup {
-        todo!("Implement bind group creation")
-    }
-
-    fn create_compute_pipeline(
-        &self,
-        layout: &wgpu::BindGroupLayout,
-        shader: &wgpu::ShaderModule,
-    ) -> wgpu::ComputePipeline {
-        todo!("Implement compute pipeline creation")
-    }
-
-    async fn execute_compute_pass(
-        &self,
-        pipeline: &wgpu::ComputePipeline,
-        bind_group: &wgpu::BindGroup,
-        op: &Operation,
-        output_shape: &Shape,
-    ) {
-        todo!("Implement compute pass execution")
-    }
-
-    async fn read_buffer_results(
-        &self,
-        output_buffer: &wgpu::Buffer,
-        output_shape: &Shape,
-    ) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
-        todo!("Implement buffer result reading")
-    }
 }
