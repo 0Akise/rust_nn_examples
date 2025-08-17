@@ -56,6 +56,11 @@ impl ShaderManager {
             include_str!("shaders/matrix_multiply.wgsl").to_string(),
         );
 
+        self.template_cache.insert(
+            Operation::Transpose,
+            include_str!("shaders/transpose.wgsl").to_string(),
+        );
+
         Ok(())
     }
 
@@ -101,6 +106,14 @@ impl ShaderManager {
                     .set_variable("P", shape_b.dims[1])
                     .set_variable("WORKGROUP_SIZE_X", 8)
                     .set_variable("WORKGROUP_SIZE_Y", 8);
+            }
+
+            Operation::Transpose => {
+                assert_eq!(shape_a.rank(), 2, "Transpose only supports 2D matrices");
+                template
+                    .set_variable("ROWS", shape_a.dims[0])
+                    .set_variable("COLS", shape_a.dims[1])
+                    .set_variable("WORKGROUP_SIZE", 8); // 8x8 workgroup for 2D operations
             }
 
             _ => {}

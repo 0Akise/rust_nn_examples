@@ -136,6 +136,13 @@ impl GpuSession {
             .await;
     }
 
+    pub async fn transpose(
+        &mut self,
+        tensor: &Tensor,
+    ) -> Result<Tensor, Box<dyn std::error::Error>> {
+        return self.gpu.unary_op(tensor, Operation::Transpose).await;
+    }
+
     pub async fn batch_operations<F, R>(&mut self, operations: F) -> R
     where
         F: FnOnce(&mut GpuModule) -> R,
