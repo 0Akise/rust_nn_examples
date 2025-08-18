@@ -29,7 +29,7 @@ impl GpuModule {
 
         let adapter_info = adapter.get_info();
 
-        println!("Using adapter: {}", adapter_info.name);
+        println!("🌌 Using adapter: {}", adapter_info.name);
 
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {

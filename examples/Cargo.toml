@@ -5,7 +5,12 @@ edition = "2021"
 
 [dependencies]
 gpu-accel = { path = "../gpu-accel" }
+nn-backbone = { path = "../nn-backbone" }
 pollster = { workspace = true }
+
+[[bin]]
+name = "test"
+path = "src/test.rs"
 
 [[bin]]
 name = "tensor_ops"

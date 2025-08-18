@@ -7,6 +7,7 @@ use gpu_accel::{GpuSession, Tensor};
 fn accumulate_gradient(variable: &mut Variable, new_grad: &Tensor) {
     match &mut variable.grad {
         Some(existing_grad) => {
+            // TODO: better implementation, existing_grad += new_grad
             *existing_grad = Tensor::new(new_grad.data.clone(), new_grad.shape.clone());
         }
 
@@ -17,9 +18,9 @@ fn accumulate_gradient(variable: &mut Variable, new_grad: &Tensor) {
 }
 
 pub struct BackwardAdd {
-    pub session: Arc<Mutex<GpuSession>>,
     pub input_a: Weak<Mutex<Variable>>,
     pub input_b: Weak<Mutex<Variable>>,
+    pub session: Arc<Mutex<GpuSession>>,
 }
 
 impl BackwardFn for BackwardAdd {

@@ -1,4 +1,5 @@
 pub mod backwards;
+pub mod test;
 
 use backwards::BackwardAdd;
 
@@ -15,7 +16,7 @@ pub struct Variable {
     pub data: Tensor,
     pub grad: Option<Tensor>,
     pub requires_grad: bool,
-    pub grad_fn: Option<Box<dyn BackwardFn>>,
+    pub grad_fn: Option<Arc<dyn BackwardFn>>,
 }
 
 impl Variable {
@@ -97,10 +98,10 @@ impl Variable {
     pub async fn add(
         &self,
         other: &Variable,
-        gpu_session: Arc<Mutex<GpuSession>>,
+        session: Arc<Mutex<GpuSession>>,
     ) -> Result<Variable, Box<dyn std::error::Error>> {
         let result_data = {
-            let mut session = gpu_session.lock().unwrap();
+            let mut session = session.lock().unwrap();
 
             session.add(&self.data, &other.data).await?
         };
@@ -113,9 +114,9 @@ impl Variable {
             let other_ref = Arc::new(Mutex::new(other.clone()));
 
             result.grad_fn = Some(Arc::new(BackwardAdd {
-                session: gpu_session.clone(),
                 input_a: Arc::downgrade(&self_ref),
                 input_b: Arc::downgrade(&other_ref),
+                session: session.clone(),
             }));
         }
 
