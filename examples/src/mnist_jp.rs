@@ -1,6 +1,14 @@
-use std::fs;
-use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::fs::{self, File};
+use std::io::BufReader;
+use std::io::Read;
+use std::path::Path;
+
+#[derive(Debug)]
+pub struct DatasetStats {
+    pub total_images: usize,
+    pub total_pixels: usize,
+    pub density: f32,
+}
 
 #[derive(Clone)]
 pub struct Image {
@@ -46,9 +54,9 @@ impl Image {
                 println!();
             }
             if self.data[idx] == 1 {
-                print!("*");
+                print!("█");
             } else {
-                print!("o");
+                print!("·");
             }
         }
         println!();
@@ -60,100 +68,136 @@ const IMAGE_BYTES: usize = 512;
 pub struct Preproc;
 
 impl Preproc {
-    pub fn get_images(path_str: &str) -> Vec<Image> {
-        let paths = fs::read_dir(path_str).unwrap();
-        let mut images: Vec<[u8; IMAGE_BYTES]> = Vec::new();
-        let mut images_copy: Vec<Image> = Vec::new();
+    fn unpack_image(packed_data: [u8; IMAGE_BYTES]) -> Image {
+        let mut image = Image::new();
 
-        for path in paths {
-            let mut idx_bytes: usize = 0;
-
-            for i in 0..20 {
-                let mut buf = [0; IMAGE_BYTES];
-                let mut file = match File::open(&path.unwrap().path()) {
-                    Err(why) => panic!("couldn't open the File: {}", why),
-                    Ok(file) => file,
-                };
-                let _ = file.seek(SeekFrom::Start(idx_bytes as u64));
-                let _ = file.read_exact(&mut buf);
-
-                images.push(buf);
-
-                idx_bytes += IMAGE_BYTES;
-            }
-        }
-
-        for image in &images {
-            let mut buf = [[0u8; 64]; 64];
-
-            for y in 0..64 {
-                for x in 0..8 {
-                    let mut mask = 0x80u8;
-
-                    for i in 0..8 {
-                        if (image[y * 8 + x] & mask) == 0 {
-                            buf[y][x * 8 + i] |= 0;
-                        } else {
-                            buf[y][x * 8 + i] |= 1;
-                        }
-                        mask = mask >> 1;
-                    }
-                }
-            }
-
-            let mut image_copy: Image = Image::new();
-
-            for y in 0..64 {
-                for x in 0..64 {
-                    image_copy.data.push(buf[y][x]);
-                }
-            }
-            image_copy.blocksize = 64;
-            images_copy.push(image_copy);
-        }
-
-        return images_copy;
-    }
-
-    pub fn normalize(image: Image) -> Image {
-        let img = Image::to_array(image);
-        let mut it: usize = 63;
-        let mut ib: usize = 0;
-        let mut il: usize = 63;
-        let mut ir: usize = 0;
+        image.data.reserve_exact(64 * 64);
 
         for y in 0..64 {
-            for x in 0..64 {
-                if img[y][x] == 1 {
-                    ib = if ib < y { y } else { ib };
-                    it = if it > y { y } else { it };
-                    il = if il > x { x } else { il };
-                    ir = if ir < x { x } else { ir };
+            for x_byte in 0..8 {
+                let byte = packed_data[y * 8 + x_byte];
+
+                for bit_pos in 0..8 {
+                    let pixel = if (byte & (0x80 >> bit_pos)) != 0 {
+                        1
+                    } else {
+                        0
+                    };
+
+                    image.data.push(pixel);
                 }
             }
         }
 
-        let _blocksize = ir - il;
-        let mut img_copy = Image::new();
+        image.blocksize = 64;
 
-        for y in it..ib + 1 {
-            for x in il..ir + 1 {
-                img_copy.data.push(img[y][x]);
+        return image;
+    }
+
+    fn load_images_from_file(file_path: &Path) -> std::io::Result<Vec<Image>> {
+        let file = File::open(file_path).unwrap();
+        let file_size = file.metadata().unwrap().len() as usize;
+
+        if file_size % IMAGE_BYTES != 0 {
+            eprintln!(
+                "⚠️  Warning: File size {} is not multiple of image size {}",
+                file_size, IMAGE_BYTES
+            );
+        }
+
+        let images_count = file_size / IMAGE_BYTES;
+        let mut images = Vec::with_capacity(images_count);
+        let mut reader = BufReader::new(file);
+
+        for _ in 0..images_count {
+            let mut buffer = [0u8; IMAGE_BYTES];
+
+            reader.read_exact(&mut buffer).unwrap();
+
+            let image = Self::unpack_image(buffer);
+
+            images.push(image);
+        }
+
+        return Ok(images);
+    }
+
+    pub fn get_images(path_str: &str) -> Result<Vec<Image>, Box<dyn std::error::Error>> {
+        let dir_path = Path::new(path_str);
+        let entries: Vec<_> = fs::read_dir(dir_path)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.path().is_file())
+            .collect();
+        let mut all_images = Vec::new();
+        let mut total_files = 0;
+        let mut total_images = 0;
+
+        for entry in entries {
+            let file_path = entry.path();
+
+            match Self::load_images_from_file(&file_path) {
+                Ok(mut images) => {
+                    total_files += 1;
+                    total_images += images.len();
+                    all_images.append(&mut images);
+                }
+
+                Err(e) => {
+                    eprintln!("⚠️  Failed to load {:?}: {}", file_path, e);
+                }
             }
         }
 
-        img_copy.blocksize = _blocksize + 1;
+        println!(
+            "Summary: {} images from {} files",
+            total_images, total_files
+        );
 
-        return img_copy;
+        return Ok(all_images);
+    }
+
+    pub fn images_to_tensor_data(images: &[Image]) -> Vec<f32> {
+        images
+            .iter()
+            .flat_map(|img| img.data.iter().map(|&x| x as f32))
+            .collect()
+    }
+
+    pub fn analyze_dataset(images: &[Image]) -> DatasetStats {
+        let total_pixels: usize = images.iter().map(|img| img.data.len()).sum();
+        let total_ones: usize = images
+            .iter()
+            .map(|img| img.data.iter().filter(|&&x| x == 1).count())
+            .sum();
+
+        return DatasetStats {
+            total_images: images.len(),
+            total_pixels,
+            density: total_ones as f32 / total_pixels as f32,
+        };
     }
 }
 
-fn main() {
-    let images: Vec<Image> = Preproc::get_images("./data/MNIST_JP");
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let images = Preproc::get_images("./data/MNIST_JP/images").unwrap();
 
-    for img in images {
-        img.display();
+    if let Some(first_image) = images.first() {
+        println!("First image:");
 
-        break;
+        first_image.display();
     }
+
+    let stats = Preproc::analyze_dataset(&images);
+
+    println!("\nDataset Statistics:");
+    println!("  Images: {}", stats.total_images);
+    println!("  Total pixels: {}", stats.total_pixels);
+    println!("  Density: {:.2}%", stats.density * 100.0);
+
+    let tensor_data = Preproc::images_to_tensor_data(&images);
+
+    println!("  Tensor data length: {}", tensor_data.len());
+
+    return Ok(());
 }

@@ -12,5 +12,9 @@ name = "tensor_ops"
 path = "src/tensorops.rs"
 
 [[bin]]
+name = "mnist"
+path = "src/mnist.rs"
+
+[[bin]]
 name = "mnist_jp"
 path = "src/mnist_jp.rs"
