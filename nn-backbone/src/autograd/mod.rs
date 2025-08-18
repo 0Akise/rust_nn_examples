@@ -1,7 +1,7 @@
 pub mod backwards;
 pub mod test;
 
-use backwards::BackwardAdd;
+use backwards::{BackwardAdd, BackwardMatMul, BackwardMul};
 
 use std::fmt::Debug;
 use std::sync::{Arc, Mutex};
@@ -121,5 +121,63 @@ impl Variable {
         }
 
         return Ok(result);
+    }
+
+    pub async fn mul(
+        &self,
+        other: &Variable,
+        session: Arc<Mutex<GpuSession>>,
+    ) -> Result<Variable, Box<dyn std::error::Error>> {
+        let result_data = {
+            let mut session = session.lock().unwrap();
+            session.multiply(&self.data, &other.data).await?
+        };
+
+        let requires_grad = self.requires_grad || other.requires_grad;
+        let mut result = Variable::new(result_data, requires_grad);
+
+        if requires_grad {
+            let self_ref = Arc::new(Mutex::new(self.clone()));
+            let other_ref = Arc::new(Mutex::new(other.clone()));
+
+            result.grad_fn = Some(Arc::new(BackwardMul {
+                input_a: Arc::downgrade(&self_ref),
+                input_b: Arc::downgrade(&other_ref),
+                input_a_data: Tensor::new(self.data.data.clone(), self.data.shape.clone()),
+                input_b_data: Tensor::new(other.data.data.clone(), other.data.shape.clone()),
+                session: session.clone(),
+            }));
+        }
+
+        Ok(result)
+    }
+
+    pub async fn matmul(
+        &self,
+        other: &Variable,
+        session: Arc<Mutex<GpuSession>>,
+    ) -> Result<Variable, Box<dyn std::error::Error>> {
+        let result_data = {
+            let mut session = session.lock().unwrap();
+            session.matmul(&self.data, &other.data).await?
+        };
+
+        let requires_grad = self.requires_grad || other.requires_grad;
+        let mut result = Variable::new(result_data, requires_grad);
+
+        if requires_grad {
+            let self_ref = Arc::new(Mutex::new(self.clone()));
+            let other_ref = Arc::new(Mutex::new(other.clone()));
+
+            result.grad_fn = Some(Arc::new(BackwardMatMul {
+                input_a: Arc::downgrade(&self_ref),
+                input_b: Arc::downgrade(&other_ref),
+                input_a_data: Tensor::new(self.data.data.clone(), self.data.shape.clone()),
+                input_b_data: Tensor::new(other.data.data.clone(), other.data.shape.clone()),
+                session: session.clone(),
+            }));
+        }
+
+        Ok(result)
     }
 }

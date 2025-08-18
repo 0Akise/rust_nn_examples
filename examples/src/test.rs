@@ -6,7 +6,11 @@ fn main() {
             println!("Error: {}", e);
         }
 
-        if let Err(e) = test::simple_addition().await {
+        if let Err(e) = test::addition().await {
+            println!("Error: {}", e);
+        }
+
+        if let Err(e) = test::matmul().await {
             println!("Error: {}", e);
         }
     });
