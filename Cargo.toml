@@ -1,5 +1,5 @@
 [workspace]
-members = ["gpu-accel", "examples"]
+members = ["gpu-accel", "nn-backbone", "examples"]
 resolver = "2"
 
 [workspace.dependencies]
