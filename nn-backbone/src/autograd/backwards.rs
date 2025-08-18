@@ -1,0 +1,55 @@
+use super::{BackwardFn, Variable};
+
+use std::sync::{Arc, Mutex, Weak};
+
+use gpu_accel::{GpuSession, Tensor};
+
+fn accumulate_gradient(variable: &mut Variable, new_grad: &Tensor) {
+    match &mut variable.grad {
+        Some(existing_grad) => {
+            *existing_grad = Tensor::new(new_grad.data.clone(), new_grad.shape.clone());
+        }
+
+        None => {
+            variable.grad = Some(Tensor::new(new_grad.data.clone(), new_grad.shape.clone()));
+        }
+    }
+}
+
+pub struct BackwardAdd {
+    pub session: Arc<Mutex<GpuSession>>,
+    pub input_a: Weak<Mutex<Variable>>,
+    pub input_b: Weak<Mutex<Variable>>,
+}
+
+impl BackwardFn for BackwardAdd {
+    fn backward(&self, grad_output: &Tensor) {
+        if let Some(input_a) = self.input_a.upgrade() {
+            if let Ok(mut var_a) = input_a.try_lock() {
+                if var_a.requires_grad {
+                    accumulate_gradient(&mut var_a, grad_output);
+
+                    if let Some(grad_fn) = &var_a.grad_fn {
+                        if let Some(grad) = &var_a.grad {
+                            grad_fn.backward(grad);
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(input_b) = self.input_b.upgrade() {
+            if let Ok(mut var_b) = input_b.try_lock() {
+                if var_b.requires_grad {
+                    accumulate_gradient(&mut var_b, grad_output);
+
+                    if let Some(grad_fn) = &var_b.grad_fn {
+                        if let Some(grad) = &var_b.grad {
+                            grad_fn.backward(grad);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
