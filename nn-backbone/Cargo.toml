@@ -5,4 +5,6 @@ edition = "2021"
 description = "simple Neural Network Backbone for examples"
 
 [dependencies]
+gpu-accel = { path = "../gpu-accel" }
+pollster = { workspace = true }
 rand = "*"

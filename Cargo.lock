@@ -519,6 +519,8 @@ dependencies = [
 name = "nn-backbone"
 version = "0.1.0"
 dependencies = [
+ "gpu-accel",
+ "pollster",
  "rand",
 ]
 
