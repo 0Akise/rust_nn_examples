@@ -12,5 +12,5 @@ name = "tensor_ops"
 path = "src/tensorops.rs"
 
 [[bin]]
-name = "matrix_ops"
-path = "src/matrix_operations.rs"
+name = "mnist_jp"
+path = "src/mnist_jp.rs"
