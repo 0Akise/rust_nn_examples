@@ -91,9 +91,10 @@ pub enum ReduceOp {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Operation {
-    ElementWiseMultiply,
-    ElementWiseAdd,
-    MatrixMultiply,
+    Mul,
+    Add,
+    MatMul,
+    Dot,
     Transpose,
     Reduce(ReduceOp),
 }
@@ -109,31 +110,36 @@ impl GpuSession {
         });
     }
 
-    pub async fn matmul(
-        &mut self,
-        a: &Tensor,
-        b: &Tensor,
-    ) -> Result<Tensor, Box<dyn std::error::Error>> {
-        return self.gpu.binary_op(a, b, Operation::MatrixMultiply).await;
-    }
-
     pub async fn add(
         &mut self,
         a: &Tensor,
         b: &Tensor,
     ) -> Result<Tensor, Box<dyn std::error::Error>> {
-        return self.gpu.binary_op(a, b, Operation::ElementWiseAdd).await;
+        return self.gpu.binary_op(a, b, Operation::Add).await;
     }
 
-    pub async fn multiply(
+    pub async fn mul(
         &mut self,
         a: &Tensor,
         b: &Tensor,
     ) -> Result<Tensor, Box<dyn std::error::Error>> {
-        return self
-            .gpu
-            .binary_op(a, b, Operation::ElementWiseMultiply)
-            .await;
+        return self.gpu.binary_op(a, b, Operation::Mul).await;
+    }
+
+    pub async fn matmul(
+        &mut self,
+        a: &Tensor,
+        b: &Tensor,
+    ) -> Result<Tensor, Box<dyn std::error::Error>> {
+        return self.gpu.binary_op(a, b, Operation::MatMul).await;
+    }
+
+    pub async fn dot(
+        &mut self,
+        a: &Tensor,
+        b: &Tensor,
+    ) -> Result<Tensor, Box<dyn std::error::Error>> {
+        return self.gpu.binary_op(a, b, Operation::Dot).await;
     }
 
     pub async fn transpose(

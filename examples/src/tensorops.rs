@@ -45,7 +45,7 @@ async fn tensorops_demo() {
     let result2 = gpu_session.add(&result1, &matrix_c).await.unwrap();
     print_matrix("(A x B) + C", &result2);
 
-    let result3 = gpu_session.multiply(&result1, &matrix_c).await.unwrap();
+    let result3 = gpu_session.mul(&result1, &matrix_c).await.unwrap();
     print_matrix("(A x B) ⊙ C", &result3);
 
     let transpose_a = gpu_session.transpose(&matrix_a).await.unwrap();

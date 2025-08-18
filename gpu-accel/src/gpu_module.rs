@@ -40,7 +40,8 @@ impl GpuModule {
                 trace: wgpu::Trace::Off,
             })
             .await
-            .map_err(|e| format!("Failed to request device: {}", e))?;
+            .map_err(|e| format!("Failed to request device: {}", e))
+            .unwrap();
 
         let info = GpuInfo {
             name: adapter_info.name.clone(),
@@ -50,7 +51,7 @@ impl GpuModule {
         };
 
         let mut shader_manager = ShaderManager::new();
-        shader_manager.load_templates()?;
+        shader_manager.load_templates().unwrap();
 
         return Ok(Self {
             adapter,
@@ -67,21 +68,33 @@ impl GpuModule {
         op: Operation,
     ) -> Result<Tensor, Box<dyn std::error::Error>> {
         let output_shape = match op {
-            Operation::Transpose => {
-                assert_eq!(
-                    tensor.shape.rank(),
-                    2,
-                    "Transpose only supports 2D matrices"
-                );
-                Shape::new(vec![tensor.shape.dims[1], tensor.shape.dims[0]])
-            }
+            Operation::Transpose => match tensor.shape.rank() {
+                1 => tensor.shape.clone(),
+
+                2 => Shape::new(vec![tensor.shape.dims[1], tensor.shape.dims[0]]),
+
+                _ => {
+                    return Err(format!(
+                        "Transpose only supports 1D/2Ds. got {}D tensor",
+                        tensor.shape.rank()
+                    )
+                    .into());
+                }
+            },
 
             _ => return Err("Unary operation not supported".into()),
         };
 
+        if let Operation::Transpose = op {
+            if tensor.shape.rank() == 1 {
+                return Ok(Tensor::new(tensor.data.clone(), output_shape));
+            }
+        }
+
         let shader_source = self
             .shader_manager
-            .generate_shader_source(&op, &tensor.shape, None)?;
+            .generate_shader_source(&op, &tensor.shape, None)
+            .unwrap();
 
         let shader_module = self
             .device
@@ -249,26 +262,32 @@ impl GpuModule {
         op: Operation,
     ) -> Result<Tensor, Box<dyn std::error::Error>> {
         let output_shape = match op {
-            Operation::ElementWiseAdd | Operation::ElementWiseMultiply => {
+            Operation::Add | Operation::Mul => {
                 assert_eq!(tensor_a.shape, tensor_b.shape);
                 tensor_a.shape.clone()
             }
 
-            Operation::MatrixMultiply => {
+            Operation::MatMul => {
                 assert_eq!(tensor_a.shape.rank(), 2);
                 assert_eq!(tensor_b.shape.rank(), 2);
                 assert_eq!(tensor_a.shape.dims[1], tensor_b.shape.dims[0]);
                 Shape::new(vec![tensor_a.shape.dims[0], tensor_b.shape.dims[1]])
             }
 
+            Operation::Dot => {
+                assert_eq!(tensor_a.shape.rank(), 1);
+                assert_eq!(tensor_b.shape.rank(), 1);
+                assert_eq!(tensor_a.shape, tensor_b.shape);
+                Shape::new(vec![1])
+            }
+
             _ => return Err("Operation not supported".into()),
         };
 
-        let shader_source = self.shader_manager.generate_shader_source(
-            &op,
-            &tensor_a.shape,
-            Some(&tensor_b.shape),
-        )?;
+        let shader_source = self
+            .shader_manager
+            .generate_shader_source(&op, &tensor_a.shape, Some(&tensor_b.shape))
+            .unwrap();
 
         let shader_module = self
             .device
@@ -395,7 +414,7 @@ impl GpuModule {
             compute_pass.set_bind_group(0, &bind_group, &[]);
 
             match op {
-                Operation::MatrixMultiply => {
+                Operation::MatMul => {
                     let workgroups_x = (output_shape.dims[0] + 7) / 8;
                     let workgroups_y = (output_shape.dims[1] + 7) / 8;
                     compute_pass.dispatch_workgroups(workgroups_x as u32, workgroups_y as u32, 1);

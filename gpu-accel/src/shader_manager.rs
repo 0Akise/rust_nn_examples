@@ -41,20 +41,19 @@ impl ShaderManager {
     }
 
     pub fn load_templates(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        self.template_cache.insert(
-            Operation::ElementWiseMultiply,
-            include_str!("shaders/elementwise_multiply.wgsl").to_string(),
-        );
+        self.template_cache
+            .insert(Operation::Mul, include_str!("shaders/mul.wgsl").to_string());
+
+        self.template_cache
+            .insert(Operation::Add, include_str!("shaders/add.wgsl").to_string());
 
         self.template_cache.insert(
-            Operation::ElementWiseAdd,
-            include_str!("shaders/elementwise_add.wgsl").to_string(),
+            Operation::MatMul,
+            include_str!("shaders/matmul.wgsl").to_string(),
         );
 
-        self.template_cache.insert(
-            Operation::MatrixMultiply,
-            include_str!("shaders/matrix_multiply.wgsl").to_string(),
-        );
+        self.template_cache
+            .insert(Operation::Dot, include_str!("shaders/dot.wgsl").to_string());
 
         self.template_cache.insert(
             Operation::Transpose,
@@ -93,12 +92,12 @@ impl ShaderManager {
         shape_b: Option<&Shape>,
     ) {
         match op {
-            Operation::ElementWiseMultiply | Operation::ElementWiseAdd => {
+            Operation::Mul | Operation::Add => {
                 template.set_variable("TOTAL_ELEMENTS", shape_a.total_elements());
                 template.set_variable("WORKGROUP_SIZE", 64);
             }
 
-            Operation::MatrixMultiply => {
+            Operation::MatMul => {
                 let shape_b = shape_b.expect("Matrix multiply requires two shapes");
                 template
                     .set_variable("M", shape_a.dims[0])
@@ -106,6 +105,12 @@ impl ShaderManager {
                     .set_variable("P", shape_b.dims[1])
                     .set_variable("WORKGROUP_SIZE_X", 8)
                     .set_variable("WORKGROUP_SIZE_Y", 8);
+            }
+
+            Operation::Dot => {
+                template
+                    .set_variable("TOTAL_ELEMENTS", shape_a.total_elements())
+                    .set_variable("WORKGROUP_SIZE", 64);
             }
 
             Operation::Transpose => {
