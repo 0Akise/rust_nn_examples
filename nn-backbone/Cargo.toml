@@ -8,3 +8,5 @@ description = "simple Neural Network Backbone for examples"
 gpu-accel = { path = "../gpu-accel" }
 pollster = { workspace = true }
 rand = "*"
+tokio = { version = "1.0", features = ["full"] }
+lazy_static = "1.4"

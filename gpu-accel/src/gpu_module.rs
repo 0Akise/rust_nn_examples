@@ -1,6 +1,7 @@
-use wgpu::{util::DeviceExt, Adapter, Device, Queue};
+use super::shader_manager::ShaderManager;
+use super::{GpuInfo, Operation, Shape, Tensor, TensorElement};
 
-use super::{shader_manager::ShaderManager, GpuInfo, Operation, Shape, Tensor, TensorElement};
+use wgpu::{util::DeviceExt, Adapter, Device, Queue};
 
 pub struct GpuModule {
     pub adapter: Adapter,
@@ -87,7 +88,7 @@ impl GpuModule {
 
         if let Operation::Transpose = op {
             if tensor.shape.rank() == 1 {
-                return Ok(Tensor::new(tensor.data.clone(), output_shape));
+                return Ok(Tensor::new(tensor.data.to_vec(), output_shape));
             }
         }
 

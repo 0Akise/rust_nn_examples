@@ -1,18 +1,219 @@
 pub mod backwards;
-pub mod test;
 
 use backwards::{BackwardAdd, BackwardDot, BackwardMatMul, BackwardMul, BackwardTranspose};
-
-use std::fmt::Debug;
-use std::sync::{Arc, Mutex};
-
 use gpu_accel::{GpuSession, Shape, Tensor};
 
+use std::collections::HashMap;
+use std::fmt::Debug;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+
+use tokio::sync::{mpsc, Mutex, RwLock};
+
+static VARIABLE_ID_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
 pub trait BackwardFn: Send + Sync {
-    fn backward(&self, grad_output: &Tensor);
+    fn backward(&self, grad_output: &Tensor, computer: &GradientComputer);
+}
+
+pub struct GradientRegistry {
+    gradients: Arc<RwLock<HashMap<usize, Tensor>>>,
+}
+
+impl GradientRegistry {
+    pub fn new() -> Self {
+        Self {
+            gradients: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    pub async fn store_gradient(&self, var_id: usize, new_gradient: Tensor) {
+        let mut gradients = self.gradients.write().await;
+
+        match gradients.get_mut(&var_id) {
+            Some(existing_grad) => match existing_grad.add_inplace(&new_gradient) {
+                Ok(()) => {}
+                Err(e) => {
+                    eprintln!("Gradient accumulation error for variable {}: {}", var_id, e);
+
+                    *existing_grad = new_gradient;
+                }
+            },
+            None => {
+                gradients.insert(var_id, new_gradient);
+            }
+        }
+    }
+
+    pub async fn init_gradient_zero(&self, var_id: usize, shape: Shape) {
+        let mut gradients = self.gradients.write().await;
+
+        if !gradients.contains_key(&var_id) {
+            gradients.insert(var_id, Tensor::zeros(shape));
+        }
+    }
+
+    pub async fn has_gradient(&self, var_id: usize) -> bool {
+        let gradients = self.gradients.read().await;
+
+        gradients.contains_key(&var_id)
+    }
+
+    pub async fn get_gradient(&self, var_id: usize) -> Option<Tensor> {
+        let gradients = self.gradients.read().await;
+        gradients
+            .get(&var_id)
+            .map(|t| Tensor::new(t.data.to_vec(), t.shape.clone()))
+    }
+
+    pub async fn clear_gradients(&self) {
+        let mut gradients = self.gradients.write().await;
+        gradients.clear();
+    }
+}
+
+lazy_static::lazy_static! {
+    static ref GRADIENT_REGISTRY: GradientRegistry = GradientRegistry::new();
+}
+
+#[derive(Debug, Clone)]
+pub enum GradientTask {
+    Add {
+        grad_output: Tensor,
+        target_var_id: usize,
+    },
+    Mul {
+        grad_output: Tensor,
+        other_tensor_data: Arc<Vec<f32>>,
+        other_tensor_shape: Shape,
+        target_var_id: usize,
+    },
+    MatMul {
+        grad_output: Tensor,
+        other_tensor_data: Arc<Vec<f32>>,
+        other_tensor_shape: Shape,
+        is_first_input: bool,
+        target_var_id: usize,
+    },
+    Dot {
+        grad_output: Tensor,
+        other_tensor_data: Arc<Vec<f32>>,
+        other_tensor_shape: Shape,
+        target_var_id: usize,
+    },
+    Transpose {
+        grad_output: Tensor,
+        target_var_id: usize,
+    },
+}
+
+pub struct GradientComputer {
+    task_sender: mpsc::UnboundedSender<GradientTask>,
+    session: Arc<Mutex<GpuSession>>,
+}
+
+impl GradientComputer {
+    async fn process_gradient_task(
+        task: GradientTask,
+        session: &Arc<Mutex<GpuSession>>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut session = session.lock().await;
+
+        match task {
+            GradientTask::Add {
+                grad_output,
+                target_var_id,
+            } => {
+                GRADIENT_REGISTRY
+                    .store_gradient(target_var_id, grad_output)
+                    .await;
+            }
+
+            GradientTask::Mul {
+                grad_output,
+                other_tensor_data,
+                other_tensor_shape,
+                target_var_id,
+            } => {
+                let other_tensor = Tensor {
+                    data: other_tensor_data,
+                    shape: other_tensor_shape,
+                };
+                let gradient = session.mul(&grad_output, &other_tensor).await?;
+                GRADIENT_REGISTRY
+                    .store_gradient(target_var_id, gradient)
+                    .await;
+            }
+
+            GradientTask::MatMul {
+                grad_output,
+                other_tensor_data,
+                other_tensor_shape,
+                is_first_input,
+                target_var_id,
+            } => {
+                let other_tensor = Tensor {
+                    data: other_tensor_data,
+                    shape: other_tensor_shape,
+                };
+
+                let gradient = if is_first_input {
+                    let b_transposed = session.transpose(&other_tensor).await?;
+                    session.matmul(&grad_output, &b_transposed).await?
+                } else {
+                    let a_transposed = session.transpose(&other_tensor).await?;
+                    session.matmul(&a_transposed, &grad_output).await?
+                };
+                GRADIENT_REGISTRY
+                    .store_gradient(target_var_id, gradient)
+                    .await;
+            }
+
+            GradientTask::Dot {
+                grad_output,
+                other_tensor_data,
+                other_tensor_shape,
+                target_var_id,
+            } => {
+                let other_tensor = Tensor {
+                    data: other_tensor_data,
+                    shape: other_tensor_shape,
+                };
+
+                let scalar_value = grad_output.data[0];
+                let expanded_scalar = Tensor::new(
+                    vec![scalar_value; other_tensor.shape.total_elements()],
+                    other_tensor.shape.clone(),
+                );
+                let gradient = session.mul(&expanded_scalar, &other_tensor).await?;
+                GRADIENT_REGISTRY
+                    .store_gradient(target_var_id, gradient)
+                    .await;
+            }
+
+            GradientTask::Transpose {
+                grad_output,
+                target_var_id,
+            } => {
+                let gradient = session.transpose(&grad_output).await?;
+                GRADIENT_REGISTRY
+                    .store_gradient(target_var_id, gradient)
+                    .await;
+            }
+        }
+
+        return Ok(());
+    }
+
+    pub fn queue_gradient(&self, task: GradientTask) {
+        if let Err(_) = self.task_sender.send(task) {
+            eprintln!("Failed to queue gradient computation");
+        }
+    }
 }
 
 pub struct Variable {
+    pub id: usize,
     pub tensor: Tensor,
     pub grad: Option<Tensor>,
     pub requires_grad: bool,
@@ -22,6 +223,7 @@ pub struct Variable {
 impl Variable {
     pub fn new(tensor: Tensor, requires_grad: bool) -> Self {
         return Self {
+            id: VARIABLE_ID_COUNTER.fetch_add(1, Ordering::SeqCst),
             tensor,
             grad: None,
             requires_grad,
@@ -51,7 +253,23 @@ impl Variable {
         return &self.tensor;
     }
 
-    pub fn backward(&mut self) {
+    pub async fn init_gradient(&self) {
+        if self.requires_grad {
+            GRADIENT_REGISTRY
+                .init_gradient_zero(self.id, self.tensor.shape.clone())
+                .await;
+        }
+    }
+
+    pub async fn has_computed_gradient(&self) -> bool {
+        GRADIENT_REGISTRY.has_gradient(self.id).await
+    }
+
+    pub async fn get_computed_gradient(&self) -> Option<Tensor> {
+        GRADIENT_REGISTRY.get_gradient(self.id).await
+    }
+
+    pub fn backward(&mut self, computer: &GradientComputer) {
         if !self.requires_grad {
             panic!("Cannot call backward on Variable that doesn't require gradients");
         }
@@ -63,17 +281,35 @@ impl Variable {
         if let Some(grad_fn) = &self.grad_fn {
             let grad_output = self.grad.as_ref().unwrap();
 
-            grad_fn.backward(grad_output);
+            grad_fn.backward(grad_output, computer);
+        }
+    }
+
+    pub async fn backward_async(&mut self, computer: &GradientComputer) {
+        if !self.requires_grad {
+            panic!("Cannot call backward on Variable that doesn't require gradients");
+        }
+
+        if self.grad.is_none() {
+            self.grad = Some(Tensor::ones(self.tensor.shape.clone()));
+        }
+
+        self.init_gradient().await;
+
+        if let Some(grad_fn) = &self.grad_fn {
+            let grad_output = self.grad.as_ref().unwrap();
+
+            grad_fn.backward(grad_output, computer);
         }
     }
 
     pub async fn add(
         &self,
         other: &Variable,
-        session: Arc<Mutex<GpuSession>>,
+        session: &Arc<Mutex<GpuSession>>,
     ) -> Result<Variable, Box<dyn std::error::Error>> {
         let result_data = {
-            let mut session = session.lock().unwrap();
+            let mut session = session.lock().await;
 
             session.add(&self.tensor, &other.tensor).await.unwrap()
         };
@@ -82,26 +318,22 @@ impl Variable {
         let mut result = Variable::new(result_data, requires_grad);
 
         if requires_grad {
-            let self_ref = Arc::new(Mutex::new(self.clone()));
-            let other_ref = Arc::new(Mutex::new(other.clone()));
-
             result.grad_fn = Some(Arc::new(BackwardAdd {
-                input_a: Arc::downgrade(&self_ref),
-                input_b: Arc::downgrade(&other_ref),
-                session: session.clone(),
+                input_a_id: self.id,
+                input_b_id: other.id,
             }));
         }
 
-        return Ok(result);
+        Ok(result)
     }
 
     pub async fn mul(
         &self,
         other: &Variable,
-        session: Arc<Mutex<GpuSession>>,
+        session: &Arc<Mutex<GpuSession>>,
     ) -> Result<Variable, Box<dyn std::error::Error>> {
         let result_data = {
-            let mut session = session.lock().unwrap();
+            let mut session = session.lock().await;
 
             session.mul(&self.tensor, &other.tensor).await.unwrap()
         };
@@ -110,15 +342,13 @@ impl Variable {
         let mut result = Variable::new(result_data, requires_grad);
 
         if requires_grad {
-            let self_ref = Arc::new(Mutex::new(self.clone()));
-            let other_ref = Arc::new(Mutex::new(other.clone()));
-
             result.grad_fn = Some(Arc::new(BackwardMul {
-                input_a: Arc::downgrade(&self_ref),
-                input_b: Arc::downgrade(&other_ref),
-                input_a_data: Tensor::new(self.tensor.data.clone(), self.tensor.shape.clone()),
-                input_b_data: Tensor::new(other.tensor.data.clone(), other.tensor.shape.clone()),
-                session: session.clone(),
+                input_a_id: self.id,
+                input_a_tensor: self.tensor.clone(),
+                input_a_shape: self.tensor.shape,
+                input_b_id: other.id,
+                input_b_tensor: other.tensor.clone(),
+                input_b_shape: other.tensor.shape,
             }));
         }
 
@@ -128,27 +358,24 @@ impl Variable {
     pub async fn matmul(
         &self,
         other: &Variable,
-        session: Arc<Mutex<GpuSession>>,
+        session: &Arc<Mutex<GpuSession>>,
     ) -> Result<Variable, Box<dyn std::error::Error>> {
         let result_data = {
-            let mut session = session.lock().unwrap();
-
-            session.matmul(&self.tensor, &other.tensor).await.unwrap()
+            let mut session = session.lock().await;
+            session.matmul(&self.tensor, &other.tensor).await?
         };
 
         let requires_grad = self.requires_grad || other.requires_grad;
         let mut result = Variable::new(result_data, requires_grad);
 
         if requires_grad {
-            let self_ref = Arc::new(Mutex::new(self.clone()));
-            let other_ref = Arc::new(Mutex::new(other.clone()));
-
             result.grad_fn = Some(Arc::new(BackwardMatMul {
-                input_a: Arc::downgrade(&self_ref),
-                input_b: Arc::downgrade(&other_ref),
-                input_a_data: Tensor::new(self.tensor.data.clone(), self.tensor.shape.clone()),
-                input_b_data: Tensor::new(other.tensor.data.clone(), other.tensor.shape.clone()),
-                session: session.clone(),
+                input_a_id: self.id,
+                input_a_tensor: self.tensor.clone(),
+                input_a_shape: self.tensor.shape,
+                input_b_id: other.id,
+                input_b_tensor: other.tensor.clone(),
+                input_b_shape: other.tensor.shape,
             }));
         }
 
@@ -158,27 +385,24 @@ impl Variable {
     pub async fn dot(
         &self,
         other: &Variable,
-        session: Arc<Mutex<GpuSession>>,
+        session: &Arc<Mutex<GpuSession>>,
     ) -> Result<Variable, Box<dyn std::error::Error>> {
         let result_data = {
-            let mut session = session.lock().unwrap();
-
-            session.dot(&self.tensor, &other.tensor).await.unwrap()
+            let mut session = session.lock().await;
+            session.dot(&self.tensor, &other.tensor).await?
         };
 
         let requires_grad = self.requires_grad || other.requires_grad;
         let mut result = Variable::new(result_data, requires_grad);
 
         if requires_grad {
-            let self_ref = Arc::new(Mutex::new(self.clone()));
-            let other_ref = Arc::new(Mutex::new(other.clone()));
-
             result.grad_fn = Some(Arc::new(BackwardDot {
-                input_a: Arc::downgrade(&self_ref),
-                input_b: Arc::downgrade(&other_ref),
-                input_a_data: Tensor::new(self.tensor.data.clone(), self.tensor.shape.clone()),
-                input_b_data: Tensor::new(other.tensor.data.clone(), other.tensor.shape.clone()),
-                session: session.clone(),
+                input_a_id: self.id,
+                input_a_tensor: self.tensor.clone(),
+                input_a_shape: self.tensor.shape,
+                input_b_id: other.id,
+                input_b_tensor: other.tensor.clone(),
+                input_b_shape: other.tensor.shape,
             }));
         }
 
@@ -187,24 +411,18 @@ impl Variable {
 
     pub async fn transpose(
         &self,
-        session: Arc<Mutex<GpuSession>>,
+        session: &Arc<Mutex<GpuSession>>,
     ) -> Result<Variable, Box<dyn std::error::Error>> {
         let result_data = {
-            let mut session = session.lock().unwrap();
-
-            session.transpose(&self.tensor).await.unwrap()
+            let mut session = session.lock().await;
+            session.transpose(&self.tensor).await?
         };
 
         let requires_grad = self.requires_grad;
         let mut result = Variable::new(result_data, requires_grad);
 
         if requires_grad {
-            let self_ref = Arc::new(Mutex::new(self.clone()));
-
-            result.grad_fn = Some(Arc::new(BackwardTranspose {
-                input: Arc::downgrade(&self_ref),
-                session: session.clone(),
-            }));
+            result.grad_fn = Some(Arc::new(BackwardTranspose { input_id: self.id }));
         }
 
         return Ok(result);
@@ -214,11 +432,12 @@ impl Variable {
 impl Clone for Variable {
     fn clone(&self) -> Self {
         return Self {
-            tensor: Tensor::new(self.tensor.data.clone(), self.tensor.shape.clone()),
+            id: VARIABLE_ID_COUNTER.fetch_add(1, Ordering::SeqCst),
+            tensor: Tensor::new(self.tensor.data.to_vec(), self.tensor.shape.clone()),
             grad: self
                 .grad
                 .as_ref()
-                .map(|g| Tensor::new(g.data.clone(), g.shape.clone())),
+                .map(|g| Tensor::new(g.data.to_vec(), g.shape.clone())),
             requires_grad: self.requires_grad,
             grad_fn: self.grad_fn.clone(),
         };
