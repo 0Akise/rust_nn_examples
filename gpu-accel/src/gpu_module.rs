@@ -41,8 +41,7 @@ impl GpuModule {
                 trace: wgpu::Trace::Off,
             })
             .await
-            .map_err(|e| format!("Failed to request device: {}", e))
-            .unwrap();
+            .map_err(|e| format!("Failed to request device: {}", e))?;
 
         let info = GpuInfo {
             name: adapter_info.name.clone(),
@@ -52,7 +51,7 @@ impl GpuModule {
         };
 
         let mut shader_manager = ShaderManager::new();
-        shader_manager.load_templates().unwrap();
+        shader_manager.load_templates()?;
 
         return Ok(Self {
             adapter,
@@ -94,8 +93,7 @@ impl GpuModule {
 
         let shader_source = self
             .shader_manager
-            .generate_shader_source(&op, &tensor.shape, None)
-            .unwrap();
+            .generate_shader_source(&op, &tensor.shape, None)?;
 
         let shader_module = self
             .device
@@ -240,7 +238,7 @@ impl GpuModule {
                 .expect("Failed to poll device");
 
             if let Ok(result) = receiver.try_recv() {
-                result.unwrap();
+                result?;
                 break;
             }
         }
@@ -285,10 +283,11 @@ impl GpuModule {
             _ => return Err("Operation not supported".into()),
         };
 
-        let shader_source = self
-            .shader_manager
-            .generate_shader_source(&op, &tensor_a.shape, Some(&tensor_b.shape))
-            .unwrap();
+        let shader_source = self.shader_manager.generate_shader_source(
+            &op,
+            &tensor_a.shape,
+            Some(&tensor_b.shape),
+        )?;
 
         let shader_module = self
             .device
@@ -457,7 +456,7 @@ impl GpuModule {
                 .expect("Failed to poll device");
 
             if let Ok(result) = receiver.try_recv() {
-                result.unwrap();
+                result?;
                 break;
             }
         }

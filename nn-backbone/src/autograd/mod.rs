@@ -109,7 +109,6 @@ pub enum GradientTask {
 
 pub struct GradientComputer {
     task_sender: mpsc::UnboundedSender<GradientTask>,
-    session: Arc<Mutex<GpuSession>>,
 }
 
 impl GradientComputer {
@@ -125,10 +124,7 @@ impl GradientComputer {
             }
         });
 
-        Ok(Self {
-            task_sender,
-            session,
-        })
+        return Ok(Self { task_sender });
     }
 
     async fn process_gradient_task(
@@ -402,7 +398,7 @@ impl Variable {
         let result_data = {
             let mut session = session.lock().await;
 
-            session.add(&self.tensor, &other.tensor).await.unwrap()
+            session.add(&self.tensor, &other.tensor).await?
         };
 
         let requires_grad = self.requires_grad || other.requires_grad;
@@ -426,7 +422,7 @@ impl Variable {
         let result_data = {
             let mut session = session.lock().await;
 
-            session.mul(&self.tensor, &other.tensor).await.unwrap()
+            session.mul(&self.tensor, &other.tensor).await?
         };
 
         let requires_grad = self.requires_grad || other.requires_grad;
