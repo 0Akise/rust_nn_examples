@@ -1,88 +1,40 @@
 use gpu_accel::{Shape, Tensor};
-use nn_backbone::autograd::{GpuContext, Variable};
+use nn_backbone::autograd::Variable;
+use nn_backbone::expr::{ExprExecutor, ExprGraph};
 
 pub async fn operations() -> Result<(), Box<dyn std::error::Error>> {
-    let ctx = GpuContext::new().await?;
+    println!("🧪 Testing Expression Builder");
 
-    println!("\n🧪 Testing Simple Addition Autograd");
+    let mut executor = ExprExecutor::new().await?;
 
-    let a = Variable::with_grad(Tensor::new(vec![1.0, 2.0], Shape::new(vec![2])));
-    let b = Variable::with_grad(Tensor::new(vec![3.0, 4.0], Shape::new(vec![2])));
-
-    println!("a: {:?}", a.tensor.data);
-    println!("b: {:?}", b.tensor.data);
-
-    let mut c = ctx.forward_add(&a, &b).await?;
-
-    println!("c = a + b: {:?}", c.tensor.data);
-    println!("\n🔄 Starting backward pass...");
-
-    ctx.backward(&mut c);
-
-    println!("✅ Backward pass completed!");
-    println!("Variable c has grad_fn: {}", c.grad_fn.is_some());
-    println!("\n🧪 Testing Matrix Multiplication Autograd");
-
-    let a = Variable::with_grad(Tensor::new(
+    let input_var = Variable::with_grad(Tensor::new(
         vec![1.0, 2.0, 3.0, 4.0],
         Shape::new(vec![2, 2]),
     ));
-    let b = Variable::with_grad(Tensor::new(
+    let weights_var = Variable::with_grad(Tensor::new(
         vec![0.5, 1.0, 1.5, 2.0],
         Shape::new(vec![2, 2]),
     ));
-    let mut c = ctx.forward_matmul(&a, &b).await?;
-
-    println!("Matrix A: {:?}", a.tensor.data);
-    println!("Matrix B: {:?}", b.tensor.data);
-    println!("C = A @ B: {:?}", c.tensor.data);
-
-    ctx.backward(&mut c);
-
-    println!("✅ Matrix multiplication autograd completed!");
-    println!("\n🧪 Testing Dot Product Autograd");
-
-    let a = Variable::with_grad(Tensor::new(vec![1.0, 2.0, 3.0], Shape::new(vec![3])));
-    let b = Variable::with_grad(Tensor::new(vec![4.0, 5.0, 6.0], Shape::new(vec![3])));
-    let mut c = ctx.forward_dot(&a, &b).await?;
-
-    println!("C = A ‣ B: {:?}", c.tensor.data);
-    println!("\n🔄 Starting backward pass...");
-
-    ctx.backward(&mut c);
-
-    println!("✅ Dot product autograd completed!");
-    println!("\n🧪 Testing Transpose Autograd");
-
-    let a = Variable::with_grad(Tensor::new(vec![1.0, 2.0, 3.0], Shape::new(vec![3])));
-    let a_t = ctx.forward_transpose(&a).await?;
-    let b = Variable::with_grad(Tensor::new(
-        vec![1.0, 2.0, 3.0, 4.0],
+    let bias_var = Variable::with_grad(Tensor::new(
+        vec![0.1, 0.2, 0.3, 0.4],
         Shape::new(vec![2, 2]),
     ));
-    let mut b_t = ctx.forward_transpose(&b).await?;
 
-    println!(
-        "1D vector: {:?}, shape: {:?}",
-        a.tensor.data, a.tensor.shape.dims
-    );
-    println!(
-        "1D vector: {:?}, shape: {:?}",
-        a_t.tensor.data, a_t.tensor.shape.dims
-    );
-    println!(
-        "2D Matrix: {:?}, shape: {:?}",
-        b.tensor.data, b.tensor.shape.dims
-    );
-    println!(
-        "2D Matrix: {:?}, shape: {:?}",
-        b_t.tensor.data, b_t.tensor.shape.dims
-    );
-    println!("\n🔄 Starting backward pass...");
+    let mut graph = ExprGraph::new();
+    let input = graph.input(input_var);
+    let w = graph.input(weights_var);
+    let b = graph.input(bias_var);
 
-    ctx.backward(&mut b_t);
+    let linear = graph.matmul(input, w)?;
+    let with_b = graph.add(linear, b)?;
+    let output = graph.relu(with_b)?;
 
-    println!("✅ Transpose autograd completed!");
+    println!("✅ Expression graph built. Nodes: {}", graph.num_nodes());
+
+    let result = executor.compute_with_grad(&graph, output).await?;
+
+    println!("Result shape: {:?}", result.tensor.shape.dims);
+    println!("Result data: {:?}", &result.tensor.data[0..4]);
 
     return Ok(());
 }
