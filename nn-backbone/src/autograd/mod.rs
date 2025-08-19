@@ -113,6 +113,24 @@ pub struct GradientComputer {
 }
 
 impl GradientComputer {
+    pub async fn new(session: Arc<Mutex<GpuSession>>) -> Result<Self, Box<dyn std::error::Error>> {
+        let (task_sender, mut task_receiver) = mpsc::unbounded_channel::<GradientTask>();
+        let session_clone = session.clone();
+
+        tokio::spawn(async move {
+            while let Some(task) = task_receiver.recv().await {
+                if let Err(e) = Self::process_gradient_task(task, &session_clone).await {
+                    eprintln!("Gradient computation error: {}", e);
+                }
+            }
+        });
+
+        Ok(Self {
+            task_sender,
+            session,
+        })
+    }
+
     async fn process_gradient_task(
         task: GradientTask,
         session: &Arc<Mutex<GpuSession>>,
@@ -209,6 +227,79 @@ impl GradientComputer {
         if let Err(_) = self.task_sender.send(task) {
             eprintln!("Failed to queue gradient computation");
         }
+    }
+}
+
+pub struct GpuContext {
+    session: Arc<Mutex<GpuSession>>,
+    computer: GradientComputer,
+}
+
+impl GpuContext {
+    pub async fn new() -> Result<Self, Box<dyn std::error::Error>> {
+        println!("🌌 Initializing GPU context...");
+
+        let session = Arc::new(Mutex::new(GpuSession::new().await?));
+        let computer = GradientComputer::new(session.clone()).await?;
+
+        return Ok(Self { session, computer });
+    }
+
+    pub fn session(&self) -> &Arc<Mutex<GpuSession>> {
+        return &self.session;
+    }
+
+    pub fn computer(&self) -> &GradientComputer {
+        return &self.computer;
+    }
+
+    pub async fn forward_add(
+        &self,
+        a: &Variable,
+        b: &Variable,
+    ) -> Result<Variable, Box<dyn std::error::Error>> {
+        return a.add(b, &self.session).await;
+    }
+
+    pub async fn forward_mul(
+        &self,
+        a: &Variable,
+        b: &Variable,
+    ) -> Result<Variable, Box<dyn std::error::Error>> {
+        return a.mul(b, &self.session).await;
+    }
+
+    pub async fn forward_matmul(
+        &self,
+        a: &Variable,
+        b: &Variable,
+    ) -> Result<Variable, Box<dyn std::error::Error>> {
+        return a.matmul(b, &self.session).await;
+    }
+
+    pub async fn forward_dot(
+        &self,
+        a: &Variable,
+        b: &Variable,
+    ) -> Result<Variable, Box<dyn std::error::Error>> {
+        return a.dot(b, &self.session).await;
+    }
+
+    pub async fn forward_transpose(
+        &self,
+        a: &Variable,
+    ) -> Result<Variable, Box<dyn std::error::Error>> {
+        return a.transpose(&self.session).await;
+    }
+
+    pub fn backward(&self, var: &mut Variable) {
+        var.backward(&self.computer)
+    }
+
+    pub async fn gpu_info(&self) -> String {
+        let session = self.session.lock().await;
+
+        format!("{}", session.gpu.info.name)
     }
 }
 
@@ -344,11 +435,11 @@ impl Variable {
         if requires_grad {
             result.grad_fn = Some(Arc::new(BackwardMul {
                 input_a_id: self.id,
-                input_a_tensor: self.tensor.clone(),
-                input_a_shape: self.tensor.shape,
+                input_a_tensor: self.tensor.data.clone(),
+                input_a_shape: self.tensor.shape.clone(),
                 input_b_id: other.id,
-                input_b_tensor: other.tensor.clone(),
-                input_b_shape: other.tensor.shape,
+                input_b_tensor: other.tensor.data.clone(),
+                input_b_shape: other.tensor.shape.clone(),
             }));
         }
 
@@ -371,11 +462,11 @@ impl Variable {
         if requires_grad {
             result.grad_fn = Some(Arc::new(BackwardMatMul {
                 input_a_id: self.id,
-                input_a_tensor: self.tensor.clone(),
-                input_a_shape: self.tensor.shape,
+                input_a_tensor: self.tensor.data.clone(),
+                input_a_shape: self.tensor.shape.clone(),
                 input_b_id: other.id,
-                input_b_tensor: other.tensor.clone(),
-                input_b_shape: other.tensor.shape,
+                input_b_tensor: other.tensor.data.clone(),
+                input_b_shape: other.tensor.shape.clone(),
             }));
         }
 
@@ -398,11 +489,11 @@ impl Variable {
         if requires_grad {
             result.grad_fn = Some(Arc::new(BackwardDot {
                 input_a_id: self.id,
-                input_a_tensor: self.tensor.clone(),
-                input_a_shape: self.tensor.shape,
+                input_a_tensor: self.tensor.data.clone(),
+                input_a_shape: self.tensor.shape.clone(),
                 input_b_id: other.id,
-                input_b_tensor: other.tensor.clone(),
-                input_b_shape: other.tensor.shape,
+                input_b_tensor: other.tensor.data.clone(),
+                input_b_shape: other.tensor.shape.clone(),
             }));
         }
 

@@ -2,7 +2,6 @@ pub mod gpu_module;
 pub mod shader_manager;
 
 use gpu_module::GpuModule;
-use shader_manager::{ShaderManager, ShaderTemplate};
 
 use std::sync::Arc;
 
@@ -164,7 +163,7 @@ pub enum Operation {
 }
 
 pub struct GpuSession {
-    gpu: GpuModule,
+    pub gpu: GpuModule,
 }
 
 impl GpuSession {

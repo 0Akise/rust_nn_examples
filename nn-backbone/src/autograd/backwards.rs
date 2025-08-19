@@ -1,4 +1,4 @@
-use super::{BackwardFn, GradientComputer, GradientTask, Variable};
+use super::{BackwardFn, GradientComputer, GradientTask};
 
 use gpu_accel::{Shape, Tensor};
 
