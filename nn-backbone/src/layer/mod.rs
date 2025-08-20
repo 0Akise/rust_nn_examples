@@ -2,6 +2,8 @@ pub mod activation;
 pub mod linear;
 pub mod loss;
 pub mod model;
+pub mod optimizer;
+pub mod train;
 
 use super::autograd::{GpuContext, Variable};
 use activation::{ReLU, Softmax};

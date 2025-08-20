@@ -2,6 +2,7 @@ use gpu_accel::{Shape, Tensor};
 use nn_backbone::autograd::{GpuContext, Variable};
 use nn_backbone::layer::layers;
 use nn_backbone::layer::model::Sequential;
+use nn_backbone::layer::train::SequentialTrainer;
 
 use std::error::Error;
 use std::fs::File;
@@ -158,15 +159,15 @@ impl Dataset {
     }
 
     pub fn to_tensor_data(&self) -> (Vec<f32>, Vec<f32>) {
-        let mut image_data = Vec::with_capacity(self.images.len() * 784);
-        let mut label_data = Vec::with_capacity(self.images.len() * 10);
+        let mut data_image = Vec::with_capacity(self.images.len() * 784);
+        let mut data_label = Vec::with_capacity(self.images.len() * 10);
 
         for image in &self.images {
-            image_data.extend(image.to_normalized());
-            label_data.extend(image.to_one_hot());
+            data_image.extend(image.to_normalized());
+            data_label.extend(image.to_one_hot());
         }
 
-        (image_data, label_data)
+        (data_image, data_label)
     }
 
     pub fn print_stats(&self) {
@@ -210,6 +211,14 @@ impl MNISTClassifier {
         let ctx = Arc::new(Mutex::new(GpuContext::new().await?));
 
         return Ok(Self { model: None, ctx });
+    }
+
+    pub async fn reset_context(&mut self) -> Result<(), Box<dyn Error>> {
+        println!("🔄 Resetting GPU context...");
+
+        self.ctx = Arc::new(Mutex::new(GpuContext::new().await?));
+
+        return Ok(());
     }
 
     pub async fn with_model(mut self) -> Result<Self, Box<dyn Error>> {
@@ -318,15 +327,39 @@ impl MNISTClassifier {
             total
         );
 
+        self.reset_context().await?;
+
         return Ok(accuracy);
     }
 
-    pub fn get_parameters(&self) -> Option<Vec<&Variable>> {
-        return self.model.as_ref().map(|m| m.parameters());
-    }
+    pub async fn train(
+        &mut self,
+        train_set: &Dataset,
+        epochs: usize,
+    ) -> Result<(), Box<dyn Error>> {
+        let model = self.model.take().unwrap();
+        let mut trainer = SequentialTrainer::new(model, 0.01, self.ctx.clone());
+        let (train_images, train_labels) = train_set.to_tensor_data();
+        let train_inputs = Variable::with_grad(Tensor::new(
+            train_images,
+            Shape::new(vec![train_set.images.len(), 784]),
+        ));
+        let train_targets = Variable::with_grad(Tensor::new(
+            train_labels,
+            Shape::new(vec![train_set.images.len(), 10]),
+        ));
 
-    pub fn context(&self) -> &Arc<Mutex<GpuContext>> {
-        return &self.ctx;
+        for epoch in 0..epochs {
+            let train_loss = trainer.train_step(&train_inputs, &train_targets).await?;
+
+            println!("Epoch {}: Train Loss = {:.4}", epoch + 1, train_loss);
+        }
+
+        self.model = Some(trainer.model);
+
+        self.reset_context().await?;
+
+        Ok(())
     }
 }
 
@@ -334,16 +367,36 @@ async fn demo() -> Result<(), Box<dyn Error>> {
     println!("MNIST Neural Network Demo");
     println!();
 
-    let (train, _) = MNISTLoader::load().unwrap();
+    let (train, test) = MNISTLoader::load().unwrap();
     let mut classifier = MNISTClassifier::build_context().await?.with_model().await?;
-
-    let accuracy = classifier.evaluate(&train, Some(60000)).await?;
+    let accuracy_init = classifier.evaluate(&train, Some(60000)).await?;
 
     println!("\nModel summary 📈:");
     println!(
-        "  - Random initialization accuracy: {:.1}%",
-        accuracy * 100.0
+        "  Randomized weight accuracy:   {:.1}%",
+        accuracy_init * 100.0
     );
+
+    let train_epochs = 5;
+    let train_subset = 10000;
+    let mut small_train = Dataset::new();
+
+    small_train.images = train.images.into_iter().take(train_subset).collect();
+
+    let (train_set, valid_set) = small_train.split_train_valid(0.8);
+
+    println!(
+        "Training on {} samples, validating on {} samples",
+        train_set.images.len(),
+        valid_set.images.len()
+    );
+
+    classifier.train(&train_set, train_epochs).await?;
+
+    let learned_accuracy = classifier.evaluate(&test, Some(1000)).await?;
+
+    println!("\nModel summary 📈:");
+    println!("  Learned accuracy:   {:.1}%", learned_accuracy * 100.0);
 
     return Ok(());
 }

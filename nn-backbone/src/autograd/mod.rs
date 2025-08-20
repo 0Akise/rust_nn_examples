@@ -229,7 +229,7 @@ impl GradientComputer {
 }
 
 pub struct GpuContext {
-    session: Arc<Mutex<GpuModule>>,
+    gpu: Arc<Mutex<GpuModule>>,
     computer: GradientComputer,
 }
 
@@ -237,14 +237,14 @@ impl GpuContext {
     pub async fn new() -> Result<Self, Box<dyn Error>> {
         println!("Initializing GPU... 🌌");
 
-        let session = Arc::new(Mutex::new(GpuModule::new().await?));
-        let computer = GradientComputer::new(session.clone()).await?;
+        let gpu = Arc::new(Mutex::new(GpuModule::new().await?));
+        let computer = GradientComputer::new(gpu.clone()).await?;
 
-        return Ok(Self { session, computer });
+        return Ok(Self { gpu, computer });
     }
 
-    pub fn session(&self) -> &Arc<Mutex<GpuModule>> {
-        return &self.session;
+    pub fn gpu(&self) -> &Arc<Mutex<GpuModule>> {
+        return &self.gpu;
     }
 
     pub fn computer(&self) -> &GradientComputer {
@@ -256,7 +256,7 @@ impl GpuContext {
         a: &Variable,
         b: &Variable,
     ) -> Result<Variable, Box<dyn Error>> {
-        return a.add(b, &self.session).await;
+        return a.add(b, &self.gpu).await;
     }
 
     pub async fn forward_mul(
@@ -264,7 +264,7 @@ impl GpuContext {
         a: &Variable,
         b: &Variable,
     ) -> Result<Variable, Box<dyn Error>> {
-        return a.mul(b, &self.session).await;
+        return a.mul(b, &self.gpu).await;
     }
 
     pub async fn forward_matmul(
@@ -272,7 +272,7 @@ impl GpuContext {
         a: &Variable,
         b: &Variable,
     ) -> Result<Variable, Box<dyn Error>> {
-        return a.matmul(b, &self.session).await;
+        return a.matmul(b, &self.gpu).await;
     }
 
     pub async fn forward_dot(
@@ -280,21 +280,21 @@ impl GpuContext {
         a: &Variable,
         b: &Variable,
     ) -> Result<Variable, Box<dyn Error>> {
-        return a.dot(b, &self.session).await;
+        return a.dot(b, &self.gpu).await;
     }
 
     pub async fn forward_transpose(&self, a: &Variable) -> Result<Variable, Box<dyn Error>> {
-        return a.transpose(&self.session).await;
+        return a.transpose(&self.gpu).await;
     }
 
-    pub fn backward(&self, var: &mut Variable) {
-        var.backward(&self.computer)
+    pub async fn backward(&self, variable: &mut Variable) {
+        variable.backward(&self.computer).await;
     }
 
     pub async fn gpu_info(&self) -> String {
-        let session = self.session.lock().await;
+        let gpu = self.gpu.lock().await;
 
-        format!("{}", session.info.name)
+        format!("{}", gpu.info.name)
     }
 }
 
@@ -355,23 +355,7 @@ impl Variable {
         GRADIENT_REGISTRY.get_gradient(self.id).await
     }
 
-    pub fn backward(&mut self, computer: &GradientComputer) {
-        if self.requires_grad != true {
-            panic!("Cannot call backward on Variable that doesn't require gradients");
-        }
-
-        if self.grad.is_none() {
-            self.grad = Some(Tensor::ones(self.tensor.shape.clone()));
-        }
-
-        if let Some(grad_fn) = &self.grad_fn {
-            let grad_output = self.grad.as_ref().unwrap();
-
-            grad_fn.backward(grad_output, computer);
-        }
-    }
-
-    pub async fn backward_async(&mut self, computer: &GradientComputer) {
+    pub async fn backward(&mut self, computer: &GradientComputer) {
         if self.requires_grad != true {
             panic!("Cannot call backward on Variable that doesn't require gradients");
         }
