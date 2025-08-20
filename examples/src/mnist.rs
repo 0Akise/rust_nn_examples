@@ -213,10 +213,10 @@ impl MNISTClassifier {
         return Ok(Self { model: None, ctx });
     }
 
-    pub async fn reset_context(&mut self) -> Result<(), Box<dyn Error>> {
+    pub async fn reset_gpu(&mut self) -> Result<(), Box<dyn Error>> {
         println!("🔄 Resetting GPU context...");
 
-        self.ctx = Arc::new(Mutex::new(GpuContext::new().await?));
+        self.ctx.lock().await.reset().await?;
 
         return Ok(());
     }
@@ -240,14 +240,35 @@ impl MNISTClassifier {
     pub async fn forward(&mut self, batch: &[&Image]) -> Result<Vec<usize>, Box<dyn Error>> {
         let model = self.model.as_mut().ok_or("Model not initialized")?;
         let batch_size = batch.len();
-        let mut image_data = Vec::with_capacity(batch_size * 784);
 
+        if batch_size == 0 {
+            return Err("Empty batch provided".into());
+        }
+
+        println!("Forward pass for batch size: {}", batch_size);
+
+        let mut image_data = Vec::with_capacity(batch_size * 784);
         for image in batch {
             image_data.extend(image.to_normalized());
         }
 
+        if image_data.len() != batch_size * 784 {
+            return Err(format!(
+                "Data size mismatch: expected {}, got {}",
+                batch_size * 784,
+                image_data.len()
+            )
+            .into());
+        }
+
         let input = Variable::with_grad(Tensor::new(image_data, Shape::new(vec![batch_size, 784])));
+
+        println!("Input shape: {:?}", input.shape());
+
         let output = model.forward(&input).await?;
+
+        println!("Output shape: {:?}", output.shape());
+
         let mut predictions = Vec::with_capacity(batch_size);
 
         for i in 0..batch_size {
@@ -269,9 +290,14 @@ impl MNISTClassifier {
     }
 
     pub fn calculate_batch_size(total_samples: usize) -> usize {
-        const MAX_ITERATIONS: usize = 12;
+        const MAX_ELEMENTS_PER_BATCH: usize = 1_000_000;
+        const MNIST_FEATURES: usize = 784;
 
-        return (total_samples + MAX_ITERATIONS - 1) / MAX_ITERATIONS;
+        let max_batch = MAX_ELEMENTS_PER_BATCH / MNIST_FEATURES;
+        let desired_iterations = 12;
+        let computed_batch = (total_samples + desired_iterations - 1) / desired_iterations;
+
+        computed_batch.min(max_batch).max(100)
     }
 
     pub async fn evaluate(
@@ -279,8 +305,10 @@ impl MNISTClassifier {
         dataset: &Dataset,
         max_samples: Option<usize>,
     ) -> Result<f32, Box<dyn Error>> {
-        let total = max_samples.unwrap_or(dataset.images.len());
-        let batch_size = Self::calculate_batch_size(total);
+        let total = max_samples
+            .unwrap_or(dataset.images.len())
+            .min(dataset.images.len());
+        let batch_size = 200;
         let iterations = (total + batch_size - 1) / batch_size;
 
         println!(
@@ -290,22 +318,28 @@ impl MNISTClassifier {
 
         let mut correct = 0;
 
-        for batch_start in (0..total).step_by(batch_size) {
-            let batch_end = (batch_start + batch_size).min(total);
-            let current_batch: Vec<&Image> = dataset
-                .images
-                .iter()
-                .skip(batch_start)
-                .take(batch_end - batch_start)
-                .collect();
+        for batch_idx in 0..iterations {
+            let batch_start = batch_idx * batch_size;
+            let batch_end = ((batch_idx + 1) * batch_size).min(total);
 
-            let iteration = (batch_start / batch_size) + 1;
+            if batch_start >= total || batch_end <= batch_start {
+                println!("⚠️ Skipping empty batch {}-{}", batch_start, batch_end);
+                continue;
+            }
+
+            let current_batch: Vec<&Image> =
+                dataset.images[batch_start..batch_end].iter().collect();
+
+            if current_batch.is_empty() {
+                println!("⚠️ Empty batch detected at iteration {}", batch_idx + 1);
+                continue;
+            }
 
             println!(
-                "  Processing batch {}-{} (iteration {}-{})",
+                "  Processing batch {}-{} (iteration {}/{})",
                 batch_start + 1,
                 batch_end,
-                iteration,
+                batch_idx + 1,
                 iterations
             );
 
@@ -319,7 +353,6 @@ impl MNISTClassifier {
         }
 
         let accuracy = correct as f32 / total as f32;
-
         println!(
             "Accuracy: {:.2}% ({}/{} correct)",
             accuracy * 100.0,
@@ -327,7 +360,7 @@ impl MNISTClassifier {
             total
         );
 
-        return Ok(accuracy);
+        Ok(accuracy)
     }
 
     pub async fn train(
@@ -367,8 +400,6 @@ async fn demo() -> Result<(), Box<dyn Error>> {
     let mut classifier = MNISTClassifier::build_context().await?.with_model().await?;
     let accuracy_init = classifier.evaluate(&test, Some(6000)).await?;
 
-    classifier.reset_context().await?;
-
     println!("\nModel summary 📈:");
     println!(
         "  Randomized weight accuracy:   {:.1}%",
@@ -390,7 +421,6 @@ async fn demo() -> Result<(), Box<dyn Error>> {
     );
 
     classifier.train(&train_set, train_epochs).await?;
-    classifier.reset_context().await?;
 
     let accuracy_learned = classifier.evaluate(&test, Some(1000)).await?;
 

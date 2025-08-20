@@ -1,8 +1,11 @@
 use super::Variable;
+use crate::autograd::backward::BackwardCrossEntropy;
+use crate::autograd::BackwardFn;
 
-use gpu_accel::Tensor;
+use gpu_accel::{Shape, Tensor};
 
 use std::error::Error;
+use std::sync::Arc;
 
 pub struct CrossEntropyLoss;
 
@@ -25,9 +28,24 @@ impl CrossEntropyLoss {
             .sum::<f32>()
             / (predictions.tensor.shape.dims[0] as f32);
 
-        return Ok(Variable::with_grad(Tensor::new(
-            vec![loss],
-            gpu_accel::Shape::new(vec![1]),
-        )));
+        let grad_fn = if predictions.requires_grad {
+            Some(Arc::new(BackwardCrossEntropy {
+                predictions_id: predictions.id,
+                predictions_data: predictions.tensor.data.clone(),
+                targets_data: targets.tensor.data.clone(),
+                batch_size: predictions.tensor.shape.dims[0],
+            }) as Arc<dyn BackwardFn>)
+        } else {
+            None
+        };
+
+        let loss_var = Variable::create_result(
+            Tensor::new(vec![loss], Shape::new(vec![1])),
+            vec![predictions.id],
+            grad_fn,
+        )
+        .await;
+
+        Ok(loss_var)
     }
 }

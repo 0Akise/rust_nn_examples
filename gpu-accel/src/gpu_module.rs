@@ -1,9 +1,11 @@
 use super::shader_manager::ShaderManager;
 use super::{Operation, Shape, Tensor, TensorElement};
 
+use std::collections::HashMap;
 use std::error::Error;
+use std::sync::Arc;
 
-use wgpu::{util::DeviceExt, Adapter, Device, Queue};
+use wgpu::{util::DeviceExt, Adapter, BindGroupLayout, ComputePipeline, Device, Queue};
 
 #[derive(Debug, Clone)]
 pub struct GpuInfo {
@@ -19,6 +21,8 @@ pub struct GpuModule {
     pub queue: Queue,
     pub info: GpuInfo,
     pub shader_manager: ShaderManager,
+    pipeline_cache: HashMap<(Operation, Shape, Option<Shape>), Arc<ComputePipeline>>,
+    bind_group_layout_cache: HashMap<Operation, Arc<BindGroupLayout>>,
 }
 
 impl GpuModule {
@@ -69,13 +73,9 @@ impl GpuModule {
             queue,
             info,
             shader_manager,
+            pipeline_cache: HashMap::new(),
+            bind_group_layout_cache: HashMap::new(),
         });
-    }
-
-    pub fn force_sync(&self) {
-        let _ = self.device.poll(wgpu::PollType::Wait);
-
-        std::thread::sleep(std::time::Duration::from_millis(10));
     }
 
     pub async fn unary_op(
@@ -273,6 +273,27 @@ impl GpuModule {
         tensor_b: &Tensor,
         op: Operation,
     ) -> Result<Tensor, Box<dyn Error>> {
+        if tensor_a.shape.total_elements() == 0 || tensor_b.shape.total_elements() == 0 {
+            return Err(format!(
+                "Cannot operate on empty tensors: a={}, b={}",
+                tensor_a.shape.total_elements(),
+                tensor_b.shape.total_elements()
+            )
+            .into());
+        }
+
+        const MAX_ELEMENTS: usize = 10_000_000;
+
+        let total_elements = tensor_a.shape.total_elements() + tensor_b.shape.total_elements();
+
+        if total_elements > MAX_ELEMENTS {
+            return Err(format!(
+                "Tensor operation too large: {} elements (max {})",
+                total_elements, MAX_ELEMENTS
+            )
+            .into());
+        }
+
         let output_shape = match op {
             Operation::Add | Operation::Mul => {
                 assert_eq!(tensor_a.shape, tensor_b.shape);
@@ -482,32 +503,22 @@ impl GpuModule {
     }
 
     pub async fn add(&mut self, a: &Tensor, b: &Tensor) -> Result<Tensor, Box<dyn Error>> {
-        self.force_sync();
-
         return self.binary_op(a, b, Operation::Add).await;
     }
 
     pub async fn mul(&mut self, a: &Tensor, b: &Tensor) -> Result<Tensor, Box<dyn Error>> {
-        self.force_sync();
-
         return self.binary_op(a, b, Operation::Mul).await;
     }
 
     pub async fn matmul(&mut self, a: &Tensor, b: &Tensor) -> Result<Tensor, Box<dyn Error>> {
-        self.force_sync();
-
         return self.binary_op(a, b, Operation::MatMul).await;
     }
 
     pub async fn dot(&mut self, a: &Tensor, b: &Tensor) -> Result<Tensor, Box<dyn Error>> {
-        self.force_sync();
-
         return self.binary_op(a, b, Operation::Dot).await;
     }
 
     pub async fn transpose(&mut self, t: &Tensor) -> Result<Tensor, Box<dyn Error>> {
-        self.force_sync();
-
         return self.unary_op(t, Operation::Transpose).await;
     }
 

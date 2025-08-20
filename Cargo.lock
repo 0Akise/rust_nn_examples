@@ -610,6 +610,7 @@ dependencies = [
  "pollster",
  "rand",
  "tokio",
+ "wgpu",
 ]
 
 [[package]]
@@ -620,6 +621,7 @@ dependencies = [
  "nn-backbone",
  "pollster",
  "tokio",
+ "wgpu",
 ]
 
 [[package]]

@@ -22,11 +22,20 @@ pub enum Layer {
 
 impl Layer {
     pub async fn forward(&mut self, input: &Variable) -> Result<Variable, Box<dyn Error>> {
-        match self {
-            Layer::Linear(layer) => layer.forward(input).await,
-            Layer::ReLU(layer) => layer.forward(input).await,
-            Layer::Softmax(layer) => layer.forward(input).await,
+        let output = match self {
+            Layer::Linear(layer) => layer.forward(input).await?,
+            Layer::ReLU(layer) => layer.forward(input).await?,
+            Layer::Softmax(layer) => layer.forward(input).await?,
+        };
+
+        if output.grad_fn.is_some() {
+            println!(
+                "  Layer output var {} has grad_fn, connected to input var {}",
+                output.id, input.id
+            );
         }
+
+        Ok(output)
     }
 
     pub fn parameters(&self) -> Vec<&Variable> {

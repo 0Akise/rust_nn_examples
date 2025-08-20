@@ -3,7 +3,7 @@ use super::{Layer, Variable};
 use std::error::Error;
 
 pub struct Sequential {
-    layers: Vec<Layer>,
+    pub layers: Vec<Layer>,
 }
 
 impl Sequential {

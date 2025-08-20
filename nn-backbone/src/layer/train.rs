@@ -2,11 +2,13 @@ use super::loss::CrossEntropyLoss;
 use super::model::Sequential;
 use super::optimizer::SGD;
 use super::{GpuContext, Variable};
+use crate::autograd::{COMPUTATION_GRAPH, GRADIENT_REGISTRY};
+
+use gpu_accel::Tensor;
 
 use std::sync::Arc;
 
 use tokio::sync::Mutex;
-use tokio::time;
 
 pub struct SequentialTrainer {
     pub model: Sequential,
@@ -30,19 +32,39 @@ impl SequentialTrainer {
         inputs: &Variable,
         targets: &Variable,
     ) -> Result<f32, Box<dyn std::error::Error>> {
+        println!("📍 Forward pass starting...");
+
+        COMPUTATION_GRAPH.clear().await;
+        GRADIENT_REGISTRY.clear_gradients().await;
+
         let predictions = self.model.forward(inputs).await?;
+
+        println!("📍 Loss calculation...");
         let mut loss = self.loss_fn.forward(&predictions, targets).await?;
         let loss_value = loss.tensor.data[0];
-        let context = self.context.lock().await;
 
-        context.backward(&mut loss).await;
+        println!("📍 Backward pass starting...");
+        {
+            let context = self.context.lock().await;
+            context.backward(&mut loss).await?;
+        }
 
-        drop(context);
+        println!("📍 Checking parameter gradients...");
+        for (i, param) in self.model.parameters().iter().enumerate() {
+            if let Some(grad) = GRADIENT_REGISTRY.get_gradient(param.id).await {
+                println!(
+                    "✅ Parameter {} (var {}): gradient norm {:.6}",
+                    i,
+                    param.id,
+                    grad.data.iter().map(|x| x * x).sum::<f32>().sqrt()
+                );
+            } else {
+                println!("❌ No gradient for parameter {} (var {})", i, param.id);
+            }
+        }
 
-        time::sleep(time::Duration::from_millis(100)).await;
-
+        println!("📍 Optimizer step...");
         let mut params = self.model.parameters_mut();
-
         self.optimizer.step(&mut params).await;
         self.optimizer.zero_grad(&mut params).await;
 

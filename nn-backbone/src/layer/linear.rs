@@ -30,13 +30,16 @@ impl Linear {
             weight_data,
             Shape::new(vec![features_in, features_out]),
         ));
-        let b = if use_bias {
-            let bias_data = vec![0.0; features_out];
 
-            Some(Variable::with_grad(Tensor::new(
-                bias_data,
+        println!("Linear layer created with weight var ID: {}", w.id);
+
+        let b = if use_bias {
+            let bias = Variable::with_grad(Tensor::new(
+                vec![0.0; features_out],
                 Shape::new(vec![features_out]),
-            )))
+            ));
+            bias.register_in_graph().await;
+            Some(bias)
         } else {
             None
         };
@@ -49,14 +52,21 @@ impl Linear {
             ctx,
         });
     }
-}
 
-impl Linear {
     pub async fn forward(&mut self, input: &Variable) -> Result<Variable, Box<dyn Error>> {
+        println!(
+            "    Linear forward: input var {}, weight var {}",
+            input.id, self.w.id
+        );
+
         let context = self.ctx.lock().await;
         let linear_output = context.forward_matmul(input, &self.w).await?;
 
+        println!("    Linear matmul output: var {}", linear_output.id);
+
         if let Some(ref bias) = self.b {
+            println!("    Adding bias var {}", bias.id);
+
             let data_bias = &bias.tensor.data;
             let bias_expanded = Variable::with_grad(Tensor::new(
                 data_bias
@@ -68,7 +78,11 @@ impl Linear {
                 linear_output.tensor.shape.clone(),
             ));
 
-            return context.forward_add(&linear_output, &bias_expanded).await;
+            let result = context.forward_add(&linear_output, &bias_expanded).await?;
+
+            println!("    Linear final output: var {}", result.id);
+
+            return Ok(result);
         } else {
             return Ok(linear_output);
         }
