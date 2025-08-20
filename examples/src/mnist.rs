@@ -1,7 +1,12 @@
+use gpu_accel::{Shape, Tensor};
+use nn_backbone::autograd::{GpuContext, Variable};
+use nn_backbone::layer::{layers, Sequential};
+
 use std::fs::File;
 use std::io::{BufReader, Read};
+use std::sync::Arc;
 
-use gpu_accel::{GpuSession, Shape, Tensor};
+use tokio::sync::Mutex;
 
 const MAGIC_IMAGE: u32 = 2051;
 const MAGIC_LABEL: u32 = 2049;
@@ -132,7 +137,7 @@ impl Dataset {
             dataset.images.push(Image::new(pixels, label));
         }
 
-        println!("✅ Loaded {} MNIST samples", dataset.images.len());
+        println!("Loaded {} MNIST samples ✅", dataset.images.len());
 
         return Ok(dataset);
     }
@@ -166,7 +171,7 @@ impl Dataset {
     }
 
     pub fn print_stats(&self) {
-        println!("\n📊 Dataset:");
+        println!("\nDataset 📊:");
         println!("  Total samples: {}", self.images.len());
     }
 }
@@ -183,8 +188,8 @@ impl MNISTLoader {
 
     pub fn load_test_data() -> Result<Dataset, Box<dyn std::error::Error>> {
         return Dataset::load_from_files(
-            "./data/MNIST/train-images.idx3-ubyte",
-            "./data/MNIST/train-labels.idx1-ubyte",
+            "./data/MNIST/test-images.idx3-ubyte",
+            "./data/MNIST/test-labels.idx1-ubyte",
         );
     }
 
@@ -196,65 +201,127 @@ impl MNISTLoader {
     }
 }
 
-pub struct MNISTTrainer {
-    session: GpuSession,
+pub struct MNISTClassifier {
+    model: Option<Sequential>,
+    ctx: Arc<Mutex<GpuContext>>,
 }
 
-impl MNISTTrainer {
-    pub async fn new() -> Result<Self, Box<dyn std::error::Error>> {
-        return Ok(Self {
-            session: GpuSession::new().await.unwrap(),
-        });
+impl MNISTClassifier {
+    pub async fn build_context() -> Result<Self, Box<dyn std::error::Error>> {
+        let ctx = Arc::new(Mutex::new(GpuContext::new().await?));
+
+        return Ok(Self { model: None, ctx });
     }
 
-    pub fn batch_to_tensors(&self, batch: &[&Image]) -> (Tensor, Tensor) {
+    pub async fn with_model(mut self) -> Result<Self, Box<dyn std::error::Error>> {
+        let ctx = Arc::clone(&self.ctx);
+
+        let model = Sequential::new()
+            .add(layers::linear(784, 128, ctx.clone()).await?) // All use same context
+            .add(layers::relu())
+            .add(layers::linear(128, 64, ctx.clone()).await?)
+            .add(layers::relu())
+            .add(layers::linear(64, 10, ctx.clone()).await?)
+            .add(layers::softmax());
+
+        self.model = Some(model);
+
+        return Ok(self);
+    }
+
+    pub async fn forward(
+        &mut self,
+        batch: &[&Image],
+    ) -> Result<Variable, Box<dyn std::error::Error>> {
+        let model = self.model.as_mut().ok_or("Model not initialized")?;
         let batch_size = batch.len();
         let mut image_data = Vec::with_capacity(batch_size * 784);
-        let mut label_data = Vec::with_capacity(batch_size * 10);
 
         for image in batch {
             image_data.extend(image.to_normalized());
-            label_data.extend(image.to_one_hot());
         }
 
-        let tensor_images = Tensor::new(image_data, Shape::new(vec![batch_size, 784]));
-        let tensor_labels = Tensor::new(label_data, Shape::new(vec![batch_size, 10]));
+        let input = Variable::with_grad(Tensor::new(image_data, Shape::new(vec![batch_size, 784])));
 
-        (tensor_images, tensor_labels)
+        return model.forward(&input).await;
     }
 
-    pub async fn forward(&mut self, dataset: &Dataset) -> Result<(), Box<dyn std::error::Error>> {
-        let batch = dataset.images.iter().take(32).collect::<Vec<_>>();
-        let (input, labels) = self.batch_to_tensors(&batch);
-        let weights = Tensor::new(vec![0.01; 784 * 10], Shape::new(vec![784, 10]));
-        let output = self.session.matmul(&input, &weights).await?;
+    pub async fn predict_single(
+        &mut self,
+        image: &Image,
+    ) -> Result<usize, Box<dyn std::error::Error>> {
+        let batch = vec![image];
+        let output = self.forward(&batch).await?;
+        let predictions = &output.tensor.data[0..10];
+        let predicted_class = predictions
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+            .map(|(index, _)| index)
+            .unwrap();
 
-        println!("forward pass:");
-        println!("    Input shape: {:?}", input.shape.dims);
-        println!("    Weights shape: {:?}", weights.shape.dims);
-        println!("    Output shape: {:?}", output.shape.dims);
-        println!("    First prediction: {:?}", &output.data[0..10]);
+        return Ok(predicted_class);
+    }
 
-        return Ok(());
+    pub async fn evaluate(&mut self, dataset: &Dataset) -> Result<f32, Box<dyn std::error::Error>> {
+        println!("Evaluating model... 📊");
+
+        let mut correct = 0;
+        let total = dataset.images.len().min(100);
+
+        for (i, image) in dataset.images.iter().take(total).enumerate() {
+            let predicted = self.predict_single(image).await?;
+            if predicted == image.label as usize {
+                correct += 1;
+            }
+
+            if (i + 1) % 25 == 0 {
+                println!("  Processed {}/{} samples", i + 1, total);
+            }
+        }
+
+        let accuracy = correct as f32 / total as f32;
+        println!(
+            "✅ Accuracy: {:.2}% ({}/{} correct)",
+            accuracy * 100.0,
+            correct,
+            total
+        );
+
+        return Ok(accuracy);
+    }
+
+    pub fn get_parameters(&self) -> Option<Vec<&Variable>> {
+        return self.model.as_ref().map(|m| m.parameters());
+    }
+
+    pub fn context(&self) -> &Arc<Mutex<GpuContext>> {
+        return &self.ctx;
     }
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn demo() -> Result<(), Box<dyn std::error::Error>> {
+    println!("MNIST Neural Network Demo");
+    println!();
+
     let (train, test) = MNISTLoader::load().unwrap();
+    let mut classifier = MNISTClassifier::build_context().await?.with_model().await?;
+    let accuracy = classifier.evaluate(&train).await?;
 
-    println!("\n    Sample images:");
-
-    for i in 0..3 {
-        if let Some(sample) = train.images.get(i) {
-            sample.display();
-
-            println!();
-        }
-    }
-
-    let mut trainer = pollster::block_on(MNISTTrainer::new()).unwrap();
-
-    pollster::block_on(trainer.forward(&train)).unwrap();
+    println!("\nModel summary 📈:");
+    println!(
+        "  - Random initialization accuracy: {:.1}%",
+        accuracy * 100.0
+    );
 
     return Ok(());
+}
+
+#[tokio::main]
+async fn main() {
+    pollster::block_on(async {
+        if let Err(e) = demo().await {
+            println!("Error: {}", e);
+        }
+    });
 }

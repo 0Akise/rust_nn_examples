@@ -26,10 +26,10 @@ fn print_matrix(name: &str, tensor: &Tensor) {
     }
 }
 
-async fn tensorops_demo() {
+async fn demo() -> Result<(), Box<dyn std::error::Error>> {
     let mut gpu_session = GpuSession::new()
         .await
-        .expect("Failed to create GPU session");
+        .expect("Failed to create GPU session ❌");
 
     let matrix_a = Tensor::new(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], Shape::new(vec![2, 3]));
     let matrix_b = Tensor::new(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], Shape::new(vec![3, 2]));
@@ -53,8 +53,14 @@ async fn tensorops_demo() {
 
     let transpose_b = gpu_session.transpose(&matrix_b).await.unwrap();
     print_matrix("B^T (2x3)", &transpose_b);
+
+    return Ok(());
 }
 
 fn main() {
-    pollster::block_on(tensorops_demo());
+    pollster::block_on(async {
+        if let Err(e) = demo().await {
+            println!("Error: {}", e);
+        }
+    });
 }

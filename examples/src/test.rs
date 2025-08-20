@@ -2,8 +2,8 @@ use gpu_accel::{Shape, Tensor};
 use nn_backbone::autograd::Variable;
 use nn_backbone::expr::{ExprExecutor, ExprGraph};
 
-pub async fn operations() -> Result<(), Box<dyn std::error::Error>> {
-    println!("🧪 Testing Expression Builder");
+pub async fn demo() -> Result<(), Box<dyn std::error::Error>> {
+    println!("Testing Expression Builder");
 
     let mut executor = ExprExecutor::new().await?;
 
@@ -27,7 +27,7 @@ pub async fn operations() -> Result<(), Box<dyn std::error::Error>> {
 
     graph.debug_print();
 
-    println!("✅ Expression graph built. Nodes: {}", graph.num_nodes());
+    println!("Expression graph built ✅ Nodes: {}", graph.num_nodes());
 
     let computed = executor.compute(&graph, output).await?;
     let result = executor.backward(computed).await?;
@@ -41,7 +41,7 @@ pub async fn operations() -> Result<(), Box<dyn std::error::Error>> {
 #[tokio::main]
 async fn main() {
     pollster::block_on(async {
-        if let Err(e) = operations().await {
+        if let Err(e) = demo().await {
             println!("Error: {}", e);
         }
     });
