@@ -327,8 +327,6 @@ impl MNISTClassifier {
             total
         );
 
-        self.reset_context().await?;
-
         return Ok(accuracy);
     }
 
@@ -357,8 +355,6 @@ impl MNISTClassifier {
 
         self.model = Some(trainer.model);
 
-        self.reset_context().await?;
-
         Ok(())
     }
 }
@@ -369,7 +365,9 @@ async fn demo() -> Result<(), Box<dyn Error>> {
 
     let (train, test) = MNISTLoader::load().unwrap();
     let mut classifier = MNISTClassifier::build_context().await?.with_model().await?;
-    let accuracy_init = classifier.evaluate(&train, Some(60000)).await?;
+    let accuracy_init = classifier.evaluate(&test, Some(6000)).await?;
+
+    classifier.reset_context().await?;
 
     println!("\nModel summary 📈:");
     println!(
@@ -386,17 +384,19 @@ async fn demo() -> Result<(), Box<dyn Error>> {
     let (train_set, valid_set) = small_train.split_train_valid(0.8);
 
     println!(
-        "Training on {} samples, validating on {} samples",
+        "\nTraining on {} samples, validating on {} samples",
         train_set.images.len(),
         valid_set.images.len()
     );
 
     classifier.train(&train_set, train_epochs).await?;
+    classifier.reset_context().await?;
 
-    let learned_accuracy = classifier.evaluate(&test, Some(1000)).await?;
+    let accuracy_learned = classifier.evaluate(&test, Some(1000)).await?;
 
     println!("\nModel summary 📈:");
-    println!("  Learned accuracy:   {:.1}%", learned_accuracy * 100.0);
+    println!("  Initial: {:.1}%", accuracy_init * 100.0);
+    println!("  Final:   {:.1}%", accuracy_learned * 100.0);
 
     return Ok(());
 }

@@ -6,6 +6,7 @@ use super::{GpuContext, Variable};
 use std::sync::Arc;
 
 use tokio::sync::Mutex;
+use tokio::time;
 
 pub struct SequentialTrainer {
     pub model: Sequential,
@@ -35,6 +36,10 @@ impl SequentialTrainer {
         let context = self.context.lock().await;
 
         context.backward(&mut loss).await;
+
+        drop(context);
+
+        time::sleep(time::Duration::from_millis(100)).await;
 
         let mut params = self.model.parameters_mut();
 

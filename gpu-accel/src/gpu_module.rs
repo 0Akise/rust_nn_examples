@@ -72,6 +72,12 @@ impl GpuModule {
         });
     }
 
+    pub fn force_sync(&self) {
+        let _ = self.device.poll(wgpu::PollType::Wait);
+
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
     pub async fn unary_op(
         &mut self,
         tensor: &Tensor,
@@ -476,22 +482,32 @@ impl GpuModule {
     }
 
     pub async fn add(&mut self, a: &Tensor, b: &Tensor) -> Result<Tensor, Box<dyn Error>> {
+        self.force_sync();
+
         return self.binary_op(a, b, Operation::Add).await;
     }
 
     pub async fn mul(&mut self, a: &Tensor, b: &Tensor) -> Result<Tensor, Box<dyn Error>> {
+        self.force_sync();
+
         return self.binary_op(a, b, Operation::Mul).await;
     }
 
     pub async fn matmul(&mut self, a: &Tensor, b: &Tensor) -> Result<Tensor, Box<dyn Error>> {
+        self.force_sync();
+
         return self.binary_op(a, b, Operation::MatMul).await;
     }
 
     pub async fn dot(&mut self, a: &Tensor, b: &Tensor) -> Result<Tensor, Box<dyn Error>> {
+        self.force_sync();
+
         return self.binary_op(a, b, Operation::Dot).await;
     }
 
     pub async fn transpose(&mut self, t: &Tensor) -> Result<Tensor, Box<dyn Error>> {
+        self.force_sync();
+
         return self.unary_op(t, Operation::Transpose).await;
     }
 
