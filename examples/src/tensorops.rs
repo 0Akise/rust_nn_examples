@@ -1,4 +1,5 @@
-use gpu_accel::{GpuSession, Shape, Tensor};
+use gpu_accel::gpu_module::GpuModule;
+use gpu_accel::{Shape, Tensor};
 
 fn print_matrix(name: &str, tensor: &Tensor) {
     println!("\n{}: {:?}", name, tensor.shape.dims);
@@ -27,7 +28,7 @@ fn print_matrix(name: &str, tensor: &Tensor) {
 }
 
 async fn demo() -> Result<(), Box<dyn std::error::Error>> {
-    let mut gpu_session = GpuSession::new()
+    let mut gpu_session = GpuModule::new()
         .await
         .expect("Failed to create GPU session ❌");
 

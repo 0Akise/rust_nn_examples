@@ -1,6 +1,8 @@
 use super::shader_manager::ShaderManager;
 use super::{Operation, Shape, Tensor, TensorElement};
 
+use std::error::Error;
+
 use wgpu::{util::DeviceExt, Adapter, Device, Queue};
 
 #[derive(Debug, Clone)]
@@ -20,7 +22,7 @@ pub struct GpuModule {
 }
 
 impl GpuModule {
-    pub async fn new() -> Result<Self, Box<dyn std::error::Error>> {
+    pub async fn new() -> Result<Self, Box<dyn Error>> {
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
             backends: wgpu::Backends::all(),
             ..Default::default()
@@ -74,7 +76,7 @@ impl GpuModule {
         &mut self,
         tensor: &Tensor,
         op: Operation,
-    ) -> Result<Tensor, Box<dyn std::error::Error>> {
+    ) -> Result<Tensor, Box<dyn Error>> {
         let output_shape = match op {
             Operation::Transpose => match tensor.shape.rank() {
                 1 => tensor.shape.clone(),
@@ -264,7 +266,7 @@ impl GpuModule {
         tensor_a: &Tensor,
         tensor_b: &Tensor,
         op: Operation,
-    ) -> Result<Tensor, Box<dyn std::error::Error>> {
+    ) -> Result<Tensor, Box<dyn Error>> {
         let output_shape = match op {
             Operation::Add | Operation::Mul => {
                 assert_eq!(tensor_a.shape, tensor_b.shape);
@@ -471,6 +473,26 @@ impl GpuModule {
         staging_buffer.unmap();
 
         return Ok(Tensor::new(output_data, output_shape));
+    }
+
+    pub async fn add(&mut self, a: &Tensor, b: &Tensor) -> Result<Tensor, Box<dyn Error>> {
+        return self.binary_op(a, b, Operation::Add).await;
+    }
+
+    pub async fn mul(&mut self, a: &Tensor, b: &Tensor) -> Result<Tensor, Box<dyn Error>> {
+        return self.binary_op(a, b, Operation::Mul).await;
+    }
+
+    pub async fn matmul(&mut self, a: &Tensor, b: &Tensor) -> Result<Tensor, Box<dyn Error>> {
+        return self.binary_op(a, b, Operation::MatMul).await;
+    }
+
+    pub async fn dot(&mut self, a: &Tensor, b: &Tensor) -> Result<Tensor, Box<dyn Error>> {
+        return self.binary_op(a, b, Operation::Dot).await;
+    }
+
+    pub async fn transpose(&mut self, t: &Tensor) -> Result<Tensor, Box<dyn Error>> {
+        return self.unary_op(t, Operation::Transpose).await;
     }
 
     pub fn print_info(&self) {

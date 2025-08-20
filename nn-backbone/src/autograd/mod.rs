@@ -1,7 +1,8 @@
 pub mod backwards;
 
 use backwards::{BackwardAdd, BackwardDot, BackwardMatMul, BackwardMul, BackwardTranspose};
-use gpu_accel::{GpuSession, Shape, Tensor};
+use gpu_accel::gpu_module::GpuModule;
+use gpu_accel::{Shape, Tensor};
 
 use std::collections::HashMap;
 use std::error::Error;
@@ -113,7 +114,7 @@ pub struct GradientComputer {
 }
 
 impl GradientComputer {
-    pub async fn new(session: Arc<Mutex<GpuSession>>) -> Result<Self, Box<dyn Error>> {
+    pub async fn new(session: Arc<Mutex<GpuModule>>) -> Result<Self, Box<dyn Error>> {
         let (task_sender, mut task_receiver) = mpsc::unbounded_channel::<GradientTask>();
         let session_clone = session.clone();
 
@@ -130,7 +131,7 @@ impl GradientComputer {
 
     async fn process_gradient_task(
         task: GradientTask,
-        session: &Arc<Mutex<GpuSession>>,
+        session: &Arc<Mutex<GpuModule>>,
     ) -> Result<(), Box<dyn Error>> {
         let mut session = session.lock().await;
 
@@ -228,7 +229,7 @@ impl GradientComputer {
 }
 
 pub struct GpuContext {
-    session: Arc<Mutex<GpuSession>>,
+    session: Arc<Mutex<GpuModule>>,
     computer: GradientComputer,
 }
 
@@ -236,13 +237,13 @@ impl GpuContext {
     pub async fn new() -> Result<Self, Box<dyn Error>> {
         println!("Initializing GPU... 🌌");
 
-        let session = Arc::new(Mutex::new(GpuSession::new().await?));
+        let session = Arc::new(Mutex::new(GpuModule::new().await?));
         let computer = GradientComputer::new(session.clone()).await?;
 
         return Ok(Self { session, computer });
     }
 
-    pub fn session(&self) -> &Arc<Mutex<GpuSession>> {
+    pub fn session(&self) -> &Arc<Mutex<GpuModule>> {
         return &self.session;
     }
 
@@ -293,7 +294,7 @@ impl GpuContext {
     pub async fn gpu_info(&self) -> String {
         let session = self.session.lock().await;
 
-        format!("{}", session.gpu.info.name)
+        format!("{}", session.info.name)
     }
 }
 
@@ -391,7 +392,7 @@ impl Variable {
     pub async fn add(
         &self,
         other: &Variable,
-        session: &Arc<Mutex<GpuSession>>,
+        session: &Arc<Mutex<GpuModule>>,
     ) -> Result<Variable, Box<dyn Error>> {
         let result_data = {
             let mut session = session.lock().await;
@@ -415,7 +416,7 @@ impl Variable {
     pub async fn mul(
         &self,
         other: &Variable,
-        session: &Arc<Mutex<GpuSession>>,
+        session: &Arc<Mutex<GpuModule>>,
     ) -> Result<Variable, Box<dyn Error>> {
         let result_data = {
             let mut session = session.lock().await;
@@ -443,7 +444,7 @@ impl Variable {
     pub async fn matmul(
         &self,
         other: &Variable,
-        session: &Arc<Mutex<GpuSession>>,
+        session: &Arc<Mutex<GpuModule>>,
     ) -> Result<Variable, Box<dyn Error>> {
         let result_data = {
             let mut session = session.lock().await;
@@ -470,7 +471,7 @@ impl Variable {
     pub async fn dot(
         &self,
         other: &Variable,
-        session: &Arc<Mutex<GpuSession>>,
+        session: &Arc<Mutex<GpuModule>>,
     ) -> Result<Variable, Box<dyn Error>> {
         let result_data = {
             let mut session = session.lock().await;
@@ -496,7 +497,7 @@ impl Variable {
 
     pub async fn transpose(
         &self,
-        session: &Arc<Mutex<GpuSession>>,
+        session: &Arc<Mutex<GpuModule>>,
     ) -> Result<Variable, Box<dyn Error>> {
         let result_data = {
             let mut session = session.lock().await;

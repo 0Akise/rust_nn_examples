@@ -216,20 +216,6 @@ impl MNISTClassifier {
         let ctx = Arc::clone(&self.ctx);
 
         let model = Sequential::new()
-            .add(layers::linear(784, 64, ctx.clone()).await?)
-            .add(layers::relu())
-            .add(layers::linear(64, 10, ctx.clone()).await?)
-            .add(layers::softmax());
-
-        self.model = Some(model);
-
-        return Ok(self);
-    }
-
-    pub async fn with_full_model(mut self) -> Result<Self, Box<dyn Error>> {
-        let ctx = Arc::clone(&self.ctx);
-
-        let model = Sequential::new()
             .add(layers::linear(784, 128, ctx.clone()).await?)
             .add(layers::relu())
             .add(layers::linear(128, 64, ctx.clone()).await?)
@@ -317,12 +303,10 @@ impl MNISTClassifier {
             let predictions = self.forward(&current_batch).await?;
 
             for (i, &predicted) in predictions.iter().enumerate() {
-                if predicted == current_batch[i].label as usize {
+                if predicted == (current_batch[i].label as usize) {
                     correct += 1;
                 }
             }
-
-            println!("  Completed batch {}-{}", batch_start + 1, batch_end);
         }
 
         let accuracy = correct as f32 / total as f32;
@@ -351,10 +335,7 @@ async fn demo() -> Result<(), Box<dyn Error>> {
     println!();
 
     let (train, _) = MNISTLoader::load().unwrap();
-    let mut classifier = MNISTClassifier::build_context()
-        .await?
-        .with_full_model()
-        .await?;
+    let mut classifier = MNISTClassifier::build_context().await?.with_model().await?;
 
     let accuracy = classifier.evaluate(&train, Some(60000)).await?;
 

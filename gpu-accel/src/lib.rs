@@ -3,6 +3,7 @@ pub mod shader_manager;
 
 use gpu_module::GpuModule;
 
+use std::error::Error;
 use std::sync::Arc;
 
 use bytemuck::{Pod, Zeroable};
@@ -148,62 +149,4 @@ pub enum Operation {
     Dot,
     Transpose,
     Reduce(ReduceOp),
-}
-
-pub struct GpuSession {
-    pub gpu: GpuModule,
-}
-
-impl GpuSession {
-    pub async fn new() -> Result<Self, Box<dyn std::error::Error>> {
-        return Ok(Self {
-            gpu: GpuModule::new().await?,
-        });
-    }
-
-    pub async fn add(
-        &mut self,
-        a: &Tensor,
-        b: &Tensor,
-    ) -> Result<Tensor, Box<dyn std::error::Error>> {
-        return self.gpu.binary_op(a, b, Operation::Add).await;
-    }
-
-    pub async fn mul(
-        &mut self,
-        a: &Tensor,
-        b: &Tensor,
-    ) -> Result<Tensor, Box<dyn std::error::Error>> {
-        return self.gpu.binary_op(a, b, Operation::Mul).await;
-    }
-
-    pub async fn matmul(
-        &mut self,
-        a: &Tensor,
-        b: &Tensor,
-    ) -> Result<Tensor, Box<dyn std::error::Error>> {
-        return self.gpu.binary_op(a, b, Operation::MatMul).await;
-    }
-
-    pub async fn dot(
-        &mut self,
-        a: &Tensor,
-        b: &Tensor,
-    ) -> Result<Tensor, Box<dyn std::error::Error>> {
-        return self.gpu.binary_op(a, b, Operation::Dot).await;
-    }
-
-    pub async fn transpose(
-        &mut self,
-        tensor: &Tensor,
-    ) -> Result<Tensor, Box<dyn std::error::Error>> {
-        return self.gpu.unary_op(tensor, Operation::Transpose).await;
-    }
-
-    pub async fn batch_operations<F, R>(&mut self, operations: F) -> R
-    where
-        F: FnOnce(&mut GpuModule) -> R,
-    {
-        return operations(&mut self.gpu);
-    }
 }
