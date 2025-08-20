@@ -7,14 +7,6 @@ use std::sync::Arc;
 
 use bytemuck::{Pod, Zeroable};
 
-#[derive(Debug, Clone)]
-pub struct GpuInfo {
-    pub name: String,
-    pub vendor: String,
-    pub device_type: String,
-    pub backend: String,
-}
-
 #[derive(Debug, Clone, PartialEq)]
 pub struct Shape {
     pub dims: Vec<usize>,
@@ -129,10 +121,6 @@ impl Tensor {
             .iter()
             .map(|&x| TensorElement { value: x })
             .collect()
-    }
-
-    pub fn memory_usage_bytes(&self) -> usize {
-        self.data.len() * std::mem::size_of::<f32>()
     }
 
     pub fn shares_data_with(&self, other: &Tensor) -> bool {

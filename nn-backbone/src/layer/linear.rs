@@ -1,0 +1,96 @@
+use super::{GpuContext, Variable};
+
+use gpu_accel::{Shape, Tensor};
+
+use std::error::Error;
+use std::sync::Arc;
+
+use tokio::sync::Mutex;
+
+pub struct Linear {
+    w: Variable,
+    b: Option<Variable>,
+    features_in: usize,
+    features_out: usize,
+    ctx: Arc<Mutex<GpuContext>>,
+}
+
+impl Linear {
+    pub async fn new(
+        features_in: usize,
+        features_out: usize,
+        use_bias: bool,
+        ctx: Arc<Mutex<GpuContext>>,
+    ) -> Result<Self, Box<dyn Error>> {
+        let scale = (2.0 / (features_in + features_out) as f32).sqrt();
+        let weight_data: Vec<f32> = (0..features_in * features_out)
+            .map(|_| (rand::random::<f32>() - 0.5) * 2.0 * scale)
+            .collect();
+        let w = Variable::with_grad(Tensor::new(
+            weight_data,
+            Shape::new(vec![features_in, features_out]),
+        ));
+        let b = if use_bias {
+            let bias_data = vec![0.0; features_out];
+
+            Some(Variable::with_grad(Tensor::new(
+                bias_data,
+                Shape::new(vec![features_out]),
+            )))
+        } else {
+            None
+        };
+
+        return Ok(Self {
+            w,
+            b,
+            features_in,
+            features_out,
+            ctx,
+        });
+    }
+}
+
+impl Linear {
+    pub async fn forward(&mut self, input: &Variable) -> Result<Variable, Box<dyn Error>> {
+        let context = self.ctx.lock().await;
+        let linear_output = context.forward_matmul(input, &self.w).await?;
+
+        if let Some(ref bias) = self.b {
+            let data_bias = &bias.tensor.data;
+            let bias_expanded = Variable::with_grad(Tensor::new(
+                data_bias
+                    .iter()
+                    .cycle()
+                    .take(linear_output.tensor.data.len())
+                    .cloned()
+                    .collect(),
+                linear_output.tensor.shape.clone(),
+            ));
+
+            return context.forward_add(&linear_output, &bias_expanded).await;
+        } else {
+            return Ok(linear_output);
+        }
+    }
+
+    pub fn parameters(&self) -> Vec<&Variable> {
+        let mut params = vec![&self.w];
+
+        if let Some(ref bias) = self.b {
+            params.push(bias);
+        }
+
+        return params;
+    }
+
+    pub fn parameters_mut(&mut self) -> Vec<&mut Variable> {
+        let mut params = vec![&mut self.w];
+
+        if let Some(ref mut bias) = self.b {
+            params.push(bias);
+        }
+
+        return params;
+    }
+}

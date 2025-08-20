@@ -1,7 +1,15 @@
 use super::shader_manager::ShaderManager;
-use super::{GpuInfo, Operation, Shape, Tensor, TensorElement};
+use super::{Operation, Shape, Tensor, TensorElement};
 
 use wgpu::{util::DeviceExt, Adapter, Device, Queue};
+
+#[derive(Debug, Clone)]
+pub struct GpuInfo {
+    pub name: String,
+    pub vendor: String,
+    pub device_type: String,
+    pub backend: String,
+}
 
 pub struct GpuModule {
     pub adapter: Adapter,

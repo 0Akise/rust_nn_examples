@@ -1,7 +1,9 @@
 use gpu_accel::{Shape, Tensor};
 use nn_backbone::autograd::{GpuContext, Variable};
-use nn_backbone::layer::{layers, Sequential};
+use nn_backbone::layer::layers;
+use nn_backbone::layer::model::Sequential;
 
+use std::error::Error;
 use std::fs::File;
 use std::io::{BufReader, Read};
 use std::sync::Arc;
@@ -72,7 +74,7 @@ impl Dataset {
         return Ok(u32::from_be_bytes(bytes));
     }
 
-    fn load_images(file_path: &str) -> Result<Vec<Vec<u8>>, Box<dyn std::error::Error>> {
+    fn load_images(file_path: &str) -> Result<Vec<Vec<u8>>, Box<dyn Error>> {
         let mut file = BufReader::new(File::open(file_path).unwrap());
         let magic = Self::read_u32_be(&mut file).unwrap();
         let num_images = Self::read_u32_be(&mut file).unwrap();
@@ -99,7 +101,7 @@ impl Dataset {
         return Ok(images);
     }
 
-    fn load_labels(file_path: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    fn load_labels(file_path: &str) -> Result<Vec<u8>, Box<dyn Error>> {
         let mut file = BufReader::new(File::open(file_path).unwrap());
         let magic = Self::read_u32_be(&mut file).unwrap();
         let num_labels = Self::read_u32_be(&mut file).unwrap();
@@ -115,10 +117,7 @@ impl Dataset {
         return Ok(labels);
     }
 
-    pub fn load_from_files(
-        images_path: &str,
-        labels_path: &str,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn load_from_files(images_path: &str, labels_path: &str) -> Result<Self, Box<dyn Error>> {
         let images_data = Self::load_images(images_path).unwrap();
         let labels_data = Self::load_labels(labels_path).unwrap();
 
@@ -179,21 +178,21 @@ impl Dataset {
 pub struct MNISTLoader;
 
 impl MNISTLoader {
-    pub fn load_train_data() -> Result<Dataset, Box<dyn std::error::Error>> {
+    fn load_train_data() -> Result<Dataset, Box<dyn Error>> {
         return Dataset::load_from_files(
             "./data/MNIST/train-images.idx3-ubyte",
             "./data/MNIST/train-labels.idx1-ubyte",
         );
     }
 
-    pub fn load_test_data() -> Result<Dataset, Box<dyn std::error::Error>> {
+    fn load_test_data() -> Result<Dataset, Box<dyn Error>> {
         return Dataset::load_from_files(
             "./data/MNIST/test-images.idx3-ubyte",
             "./data/MNIST/test-labels.idx1-ubyte",
         );
     }
 
-    pub fn load() -> Result<(Dataset, Dataset), Box<dyn std::error::Error>> {
+    pub fn load() -> Result<(Dataset, Dataset), Box<dyn Error>> {
         let train = Self::load_train_data().unwrap();
         let test = Self::load_test_data().unwrap();
 
@@ -207,13 +206,13 @@ pub struct MNISTClassifier {
 }
 
 impl MNISTClassifier {
-    pub async fn build_context() -> Result<Self, Box<dyn std::error::Error>> {
+    pub async fn build_context() -> Result<Self, Box<dyn Error>> {
         let ctx = Arc::new(Mutex::new(GpuContext::new().await?));
 
         return Ok(Self { model: None, ctx });
     }
 
-    pub async fn with_model(mut self) -> Result<Self, Box<dyn std::error::Error>> {
+    pub async fn with_model(mut self) -> Result<Self, Box<dyn Error>> {
         let ctx = Arc::clone(&self.ctx);
 
         let model = Sequential::new()
@@ -227,7 +226,7 @@ impl MNISTClassifier {
         return Ok(self);
     }
 
-    pub async fn with_full_model(mut self) -> Result<Self, Box<dyn std::error::Error>> {
+    pub async fn with_full_model(mut self) -> Result<Self, Box<dyn Error>> {
         let ctx = Arc::clone(&self.ctx);
 
         let model = Sequential::new()
@@ -243,10 +242,7 @@ impl MNISTClassifier {
         return Ok(self);
     }
 
-    pub async fn forward(
-        &mut self,
-        batch: &[&Image],
-    ) -> Result<Vec<usize>, Box<dyn std::error::Error>> {
+    pub async fn forward(&mut self, batch: &[&Image]) -> Result<Vec<usize>, Box<dyn Error>> {
         let model = self.model.as_mut().ok_or("Model not initialized")?;
         let batch_size = batch.len();
         let mut image_data = Vec::with_capacity(batch_size * 784);
@@ -277,10 +273,27 @@ impl MNISTClassifier {
         return Ok(predictions);
     }
 
-    pub async fn evaluate(&mut self, dataset: &Dataset) -> Result<f32, Box<dyn std::error::Error>> {
+    pub fn calculate_batch_size(total_samples: usize) -> usize {
+        const MAX_ITERATIONS: usize = 12;
+
+        return (total_samples + MAX_ITERATIONS - 1) / MAX_ITERATIONS;
+    }
+
+    pub async fn evaluate(
+        &mut self,
+        dataset: &Dataset,
+        max_samples: Option<usize>,
+    ) -> Result<f32, Box<dyn Error>> {
+        let total = max_samples.unwrap_or(dataset.images.len());
+        let batch_size = Self::calculate_batch_size(total);
+        let iterations = (total + batch_size - 1) / batch_size;
+
+        println!(
+            "Evaluating {} samples with batch size {} (total {} iterations)",
+            total, batch_size, iterations
+        );
+
         let mut correct = 0;
-        let total = dataset.images.len().min(60000);
-        let batch_size = 6000;
 
         for batch_start in (0..total).step_by(batch_size) {
             let batch_end = (batch_start + batch_size).min(total);
@@ -291,7 +304,15 @@ impl MNISTClassifier {
                 .take(batch_end - batch_start)
                 .collect();
 
-            println!("  Processing batch {}-{}", batch_start + 1, batch_end);
+            let iteration = (batch_start / batch_size) + 1;
+
+            println!(
+                "  Processing batch {}-{} (iteration {}-{})",
+                batch_start + 1,
+                batch_end,
+                iteration,
+                iterations
+            );
 
             let predictions = self.forward(&current_batch).await?;
 
@@ -302,11 +323,10 @@ impl MNISTClassifier {
             }
 
             println!("  Completed batch {}-{}", batch_start + 1, batch_end);
-
-            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
         }
 
         let accuracy = correct as f32 / total as f32;
+
         println!(
             "Accuracy: {:.2}% ({}/{} correct)",
             accuracy * 100.0,
@@ -326,7 +346,7 @@ impl MNISTClassifier {
     }
 }
 
-async fn demo() -> Result<(), Box<dyn std::error::Error>> {
+async fn demo() -> Result<(), Box<dyn Error>> {
     println!("MNIST Neural Network Demo");
     println!();
 
@@ -336,7 +356,7 @@ async fn demo() -> Result<(), Box<dyn std::error::Error>> {
         .with_full_model()
         .await?;
 
-    let accuracy = classifier.evaluate(&train).await?;
+    let accuracy = classifier.evaluate(&train, Some(60000)).await?;
 
     println!("\nModel summary 📈:");
     println!(

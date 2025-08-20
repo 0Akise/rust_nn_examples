@@ -5,7 +5,7 @@ this project is made of three different components:
 3. examples(main): examples using 1 and 2
 
 - currently contribution is disabled. if anyone is interested to join the development, please wait until *learning implementation* is done by repo owner.
-- project_root/data folder is excluded from the project for licensing. you will have to find data to run examples.
+- data folder is excluded from the project for licensing reasons. you will have to find appropriate data to run examples.
 
 # Current status:
 - [x] Basic Neural Network
