@@ -2,7 +2,7 @@ use super::autograd::{GpuContext, Variable};
 
 use gpu_accel::{Shape, Tensor};
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 
 #[derive(Debug, Clone)]
 pub enum Op {
@@ -27,28 +27,32 @@ pub struct ExprNode {
 pub struct ExprGraph {
     nodes: HashMap<ExprId, ExprNode>,
     inputs: HashMap<ExprId, Variable>,
-    next_id: usize,
+    id_next: usize,
 }
 
 impl ExprGraph {
     pub fn new() -> Self {
-        Self {
+        return Self {
             nodes: HashMap::new(),
             inputs: HashMap::new(),
-            next_id: 0,
-        }
+            id_next: 0,
+        };
     }
 
     fn next_id(&mut self) -> ExprId {
-        let id = self.next_id;
-        self.next_id += 1;
-        id
+        let id = self.id_next;
+
+        self.id_next += 1;
+
+        return id;
     }
 
     pub fn input(&mut self, var: Variable) -> ExprId {
         let id = self.next_id();
+
         self.inputs.insert(id, var);
-        id
+
+        return id;
     }
 
     pub fn add(&mut self, a: ExprId, b: ExprId) -> Result<ExprId, String> {
@@ -73,7 +77,7 @@ impl ExprGraph {
             },
         );
 
-        Ok(id)
+        return Ok(id);
     }
 
     pub fn mul(&mut self, a: ExprId, b: ExprId) -> Result<ExprId, String> {
@@ -98,7 +102,7 @@ impl ExprGraph {
             },
         );
 
-        Ok(id)
+        return Ok(id);
     }
 
     pub fn matmul(&mut self, a: ExprId, b: ExprId) -> Result<ExprId, String> {
@@ -129,7 +133,7 @@ impl ExprGraph {
             },
         );
 
-        Ok(id)
+        return Ok(id);
     }
 
     pub fn relu(&mut self, x: ExprId) -> Result<ExprId, String> {
@@ -146,7 +150,7 @@ impl ExprGraph {
             },
         );
 
-        Ok(id)
+        return Ok(id);
     }
 
     pub fn transpose(&mut self, x: ExprId) -> Result<ExprId, String> {
@@ -169,23 +173,39 @@ impl ExprGraph {
             },
         );
 
-        Ok(id)
+        return Ok(id);
     }
 
     fn get_shape(&self, id: ExprId) -> Result<Shape, String> {
         if let Some(var) = self.inputs.get(&id) {
-            Ok(var.tensor.shape.clone())
+            return Ok(var.tensor.shape.clone());
         } else if let Some(node) = self.nodes.get(&id) {
-            node.shape
+            return node
+                .shape
                 .clone()
-                .ok_or("Node missing shape information".to_string())
+                .ok_or("Node missing shape information".to_string());
         } else {
-            Err("Node not found in graph".to_string())
+            return Err("Node not found in graph".to_string());
         }
     }
 
     pub fn num_nodes(&self) -> usize {
-        self.nodes.len()
+        return self.nodes.len();
+    }
+
+    pub fn debug_print(&self) {
+        println!("🔍 Graph Debug Info:");
+        println!(
+            "  Input nodes: {:?}",
+            self.inputs.keys().collect::<Vec<_>>()
+        );
+        println!("  Computation nodes:");
+        for (id, node) in &self.nodes {
+            println!(
+                "    Node {}: op={:?}, inputs={:?}",
+                id, node.op, node.inputs
+            );
+        }
     }
 }
 
@@ -200,56 +220,98 @@ impl ExprExecutor {
         })
     }
 
-    fn dfs_topological(
-        &self,
-        graph: &ExprGraph,
-        node_id: ExprId,
-        visited: &mut std::collections::HashSet<ExprId>,
-        temp_visited: &mut std::collections::HashSet<ExprId>,
-        result: &mut Vec<ExprId>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        if temp_visited.contains(&node_id) {
-            return Err("Cycle detected in expression graph".into());
-        }
-
-        if visited.contains(&node_id) {
-            return Ok(());
-        }
-
-        temp_visited.insert(node_id);
-
-        if let Some(node) = graph.nodes.get(&node_id) {
-            for &input_id in &node.inputs {
-                self.dfs_topological(graph, input_id, visited, temp_visited, result)?;
-            }
-        }
-
-        temp_visited.remove(&node_id);
-        visited.insert(node_id);
-        result.push(node_id);
-
-        Ok(())
-    }
-
-    fn topological_sort(
+    fn canonical_topological_sort(
         &self,
         graph: &ExprGraph,
         id_output: ExprId,
     ) -> Result<Vec<ExprId>, Box<dyn std::error::Error>> {
-        let mut visited = std::collections::HashSet::new();
-        let mut temp_visited = std::collections::HashSet::new();
+        let mut reachable = HashSet::new();
+        let mut to_visit = VecDeque::new();
+
+        to_visit.push_back(id_output);
+
+        while let Some(node_id) = to_visit.pop_front() {
+            if reachable.contains(&node_id) {
+                continue;
+            }
+            reachable.insert(node_id);
+
+            if let Some(node) = graph.nodes.get(&node_id) {
+                for &input_id in &node.inputs {
+                    if !reachable.contains(&input_id) {
+                        to_visit.push_back(input_id);
+                    }
+                }
+            }
+        }
+
+        let mut in_degree: HashMap<ExprId, usize> = HashMap::new();
+
+        for &node_id in &reachable {
+            in_degree.insert(node_id, 0);
+        }
+
+        for &node_id in &reachable {
+            if let Some(node) = graph.nodes.get(&node_id) {
+                for &input_id in &node.inputs {
+                    if reachable.contains(&input_id) {
+                        *in_degree.get_mut(&node_id).unwrap() += 1;
+                    }
+                }
+            }
+        }
+
+        let mut queue = std::collections::BinaryHeap::new();
         let mut result = Vec::new();
 
-        self.dfs_topological(
-            graph,
-            id_output,
-            &mut visited,
-            &mut temp_visited,
-            &mut result,
-        )?;
+        for &node_id in &reachable {
+            if in_degree[&node_id] == 0 {
+                let priority = if graph.inputs.contains_key(&node_id) {
+                    -(node_id as i32) - 1000
+                } else {
+                    -(node_id as i32)
+                };
 
-        result.reverse();
-        Ok(result)
+                queue.push((priority, node_id));
+            }
+        }
+
+        while let Some((_, node_id)) = queue.pop() {
+            result.push(node_id);
+
+            for &dependent_id in &reachable {
+                if let Some(dependent_node) = graph.nodes.get(&dependent_id) {
+                    if dependent_node.inputs.contains(&node_id) {
+                        let count = in_degree.get_mut(&dependent_id).unwrap();
+
+                        *count -= 1;
+
+                        if *count == 0 {
+                            let priority = -(dependent_id as i32);
+
+                            queue.push((priority, dependent_id));
+                        }
+                    }
+                }
+            }
+        }
+
+        if result.len() != reachable.len() {
+            println!(
+                "⚠️ Result length {} != reachable length {}",
+                result.len(),
+                reachable.len()
+            );
+            println!(
+                "⚠️ Missing nodes: {:?}",
+                reachable
+                    .difference(&result.iter().cloned().collect())
+                    .collect::<Vec<_>>()
+            );
+            return Err("Cycle detected in expression graph".into());
+        }
+
+        return Ok(result);
     }
 
     pub async fn compute(
@@ -263,20 +325,30 @@ impl ExprExecutor {
             computed.insert(id, var.clone());
         }
 
-        let execution_order = self.topological_sort(graph, output_id)?;
+        let execution_order = self.canonical_topological_sort(graph, output_id)?;
 
         for node_id in execution_order {
             if computed.contains_key(&node_id) {
                 continue;
             }
 
-            let node = graph.nodes.get(&node_id).ok_or("Node not found in graph")?;
+            let node = graph
+                .nodes
+                .get(&node_id)
+                .ok_or_else(|| format!("Node {} not found in computation graph", node_id))?;
+
             let mut input_vars = Vec::new();
 
             for &input_id in &node.inputs {
-                let input_var = computed
-                    .get(&input_id)
-                    .ok_or("Input not computed when needed")?;
+                let input_var = computed.get(&input_id).ok_or_else(|| {
+                    format!(
+                        "Input {} not computed when needed for node {} (op: {:?}). Available: {:?}",
+                        input_id,
+                        node_id,
+                        node.op,
+                        computed.keys().collect::<Vec<_>>()
+                    )
+                })?;
 
                 input_vars.push(input_var.clone());
             }
@@ -317,21 +389,18 @@ impl ExprExecutor {
             computed.insert(node_id, result);
         }
 
-        Ok(computed
+        return Ok(computed
             .get(&output_id)
             .ok_or("Output node not computed")?
-            .clone())
+            .clone());
     }
 
-    pub async fn compute_with_grad(
+    pub async fn backward(
         &mut self,
-        graph: &ExprGraph,
-        id_output: ExprId,
+        mut result: Variable,
     ) -> Result<Variable, Box<dyn std::error::Error>> {
-        let mut result = self.compute(graph, id_output).await?;
-
         self.context.backward(&mut result);
 
-        Ok(result)
+        return Ok(result);
     }
 }

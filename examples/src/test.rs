@@ -7,31 +7,30 @@ pub async fn operations() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut executor = ExprExecutor::new().await?;
 
-    let input_var = Variable::with_grad(Tensor::new(
+    let mut graph = ExprGraph::new();
+    let input = graph.input(Variable::with_grad(Tensor::new(
         vec![1.0, 2.0, 3.0, 4.0],
         Shape::new(vec![2, 2]),
-    ));
-    let weights_var = Variable::with_grad(Tensor::new(
+    )));
+    let w = graph.input(Variable::with_grad(Tensor::new(
         vec![0.5, 1.0, 1.5, 2.0],
         Shape::new(vec![2, 2]),
-    ));
-    let bias_var = Variable::with_grad(Tensor::new(
+    )));
+    let b = graph.input(Variable::with_grad(Tensor::new(
         vec![0.1, 0.2, 0.3, 0.4],
         Shape::new(vec![2, 2]),
-    ));
-
-    let mut graph = ExprGraph::new();
-    let input = graph.input(input_var);
-    let w = graph.input(weights_var);
-    let b = graph.input(bias_var);
+    )));
 
     let linear = graph.matmul(input, w)?;
     let with_b = graph.add(linear, b)?;
     let output = graph.relu(with_b)?;
 
+    graph.debug_print();
+
     println!("✅ Expression graph built. Nodes: {}", graph.num_nodes());
 
-    let result = executor.compute_with_grad(&graph, output).await?;
+    let computed = executor.compute(&graph, output).await?;
+    let result = executor.backward(computed).await?;
 
     println!("Result shape: {:?}", result.tensor.shape.dims);
     println!("Result data: {:?}", &result.tensor.data[0..4]);
