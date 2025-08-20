@@ -1,8 +1,6 @@
 use super::shader_manager::ShaderManager;
 use super::{GpuInfo, Operation, Shape, Tensor, TensorElement};
 
-use std::collections::HashMap;
-
 use wgpu::{util::DeviceExt, Adapter, Device, Queue};
 
 pub struct GpuModule {

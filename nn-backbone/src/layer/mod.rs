@@ -90,10 +90,6 @@ impl Linear {
 
         return params;
     }
-
-    fn name(&self) -> &str {
-        return &self.name;
-    }
 }
 
 pub struct ReLU {
@@ -129,10 +125,6 @@ impl ReLU {
 
     fn parameters_mut(&mut self) -> Vec<&mut Variable> {
         return vec![];
-    }
-
-    fn name(&self) -> &str {
-        return &self.name;
     }
 }
 
@@ -172,10 +164,6 @@ impl Softmax {
 
     fn parameters_mut(&mut self) -> Vec<&mut Variable> {
         return vec![];
-    }
-
-    fn name(&self) -> &str {
-        return &self.name;
     }
 }
 
