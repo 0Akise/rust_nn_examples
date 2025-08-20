@@ -233,7 +233,7 @@ pub struct GpuContext {
 
 impl GpuContext {
     pub async fn new() -> Result<Self, Box<dyn std::error::Error>> {
-        println!("🌌 Initializing GPU context...");
+        println!("Initializing GPU context... 🌌");
 
         let session = Arc::new(Mutex::new(GpuSession::new().await?));
         let computer = GradientComputer::new(session.clone()).await?;

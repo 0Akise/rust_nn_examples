@@ -8,6 +8,7 @@ description = "simple GPU Backbone for examples"
 wgpu = { workspace = true }
 bytemuck = { workspace = true, features = ["derive"] }
 flume = { workspace = true }
+rand = "*"
 
 [dev-dependencies]
 pollster = { workspace = true }

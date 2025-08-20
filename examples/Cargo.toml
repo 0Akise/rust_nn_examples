@@ -10,8 +10,8 @@ pollster = { workspace = true }
 tokio = { version = "1.0", features = ["full"] }
 
 [[bin]]
-name = "test"
-path = "src/test.rs"
+name = "expression"
+path = "src/expression.rs"
 
 [[bin]]
 name = "tensor_ops"
@@ -20,7 +20,3 @@ path = "src/tensorops.rs"
 [[bin]]
 name = "mnist"
 path = "src/mnist.rs"
-
-[[bin]]
-name = "mnist_jp"
-path = "src/mnist_jp.rs"

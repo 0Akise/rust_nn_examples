@@ -1,6 +1,8 @@
 use super::shader_manager::ShaderManager;
 use super::{GpuInfo, Operation, Shape, Tensor, TensorElement};
 
+use std::collections::HashMap;
+
 use wgpu::{util::DeviceExt, Adapter, Device, Queue};
 
 pub struct GpuModule {
@@ -30,7 +32,7 @@ impl GpuModule {
 
         let adapter_info = adapter.get_info();
 
-        println!("🌌 Using adapter: {}", adapter_info.name);
+        println!("Using adapter: {}", adapter_info.name);
 
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
@@ -70,9 +72,7 @@ impl GpuModule {
         let output_shape = match op {
             Operation::Transpose => match tensor.shape.rank() {
                 1 => tensor.shape.clone(),
-
                 2 => Shape::new(vec![tensor.shape.dims[1], tensor.shape.dims[0]]),
-
                 _ => {
                     return Err(format!(
                         "Transpose only supports 1D/2Ds. got {}D tensor",
@@ -81,7 +81,6 @@ impl GpuModule {
                     .into());
                 }
             },
-
             _ => return Err("Unary operation not supported".into()),
         };
 
@@ -102,27 +101,10 @@ impl GpuModule {
                 source: wgpu::ShaderSource::Wgsl(shader_source.into()),
             });
 
-        let input_data = tensor.to_gpu_format();
-
-        let input_buffer = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("Input Buffer"),
-                contents: bytemuck::cast_slice(&input_data),
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            });
-
-        let output_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Output Buffer"),
-            size: (output_shape.total_elements() * std::mem::size_of::<TensorElement>()) as u64,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-
         let bind_group_layout =
             self.device
                 .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                    label: Some("Unary Bind Group Layout"),
+                    label: Some("Unary Op Bind Group Layout"),
                     entries: &[
                         wgpu::BindGroupLayoutEntry {
                             binding: 0,
@@ -147,8 +129,25 @@ impl GpuModule {
                     ],
                 });
 
+        let input_data = tensor.to_gpu_format();
+
+        let input_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("Input Buffer"),
+                contents: bytemuck::cast_slice(&input_data),
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            });
+
+        let output_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Output Buffer"),
+            size: (output_shape.total_elements() * std::mem::size_of::<TensorElement>()) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Unary Bind Group"),
+            label: Some("Unary Op Bind Group"),
             layout: &bind_group_layout,
             entries: &[
                 wgpu::BindGroupEntry {
@@ -165,7 +164,7 @@ impl GpuModule {
         let compute_pipeline_layout =
             self.device
                 .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                    label: Some("Unary Compute Pipeline Layout"),
+                    label: Some("Unary Op Compute Pipeline Layout"),
                     bind_group_layouts: &[&bind_group_layout],
                     push_constant_ranges: &[],
                 });
@@ -173,7 +172,7 @@ impl GpuModule {
         let compute_pipeline =
             self.device
                 .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                    label: Some("Unary Compute Pipeline"),
+                    label: Some("Unary Op Compute Pipeline"),
                     layout: Some(&compute_pipeline_layout),
                     module: &shader_module,
                     entry_point: Some("main"),
@@ -184,12 +183,12 @@ impl GpuModule {
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("Unary Compute Encoder"),
+                label: Some("Unary Op Compute Encoder"),
             });
 
         {
             let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("Unary Compute Pass"),
+                label: Some("Unary Op Compute Pass"),
                 timestamp_writes: None,
             });
 
@@ -265,21 +264,18 @@ impl GpuModule {
                 assert_eq!(tensor_a.shape, tensor_b.shape);
                 tensor_a.shape.clone()
             }
-
             Operation::MatMul => {
                 assert_eq!(tensor_a.shape.rank(), 2);
                 assert_eq!(tensor_b.shape.rank(), 2);
                 assert_eq!(tensor_a.shape.dims[1], tensor_b.shape.dims[0]);
                 Shape::new(vec![tensor_a.shape.dims[0], tensor_b.shape.dims[1]])
             }
-
             Operation::Dot => {
                 assert_eq!(tensor_a.shape.rank(), 1);
                 assert_eq!(tensor_b.shape.rank(), 1);
                 assert_eq!(tensor_a.shape, tensor_b.shape);
                 Shape::new(vec![1])
             }
-
             _ => return Err("Operation not supported".into()),
         };
 
@@ -296,36 +292,10 @@ impl GpuModule {
                 source: wgpu::ShaderSource::Wgsl(shader_source.into()),
             });
 
-        let input_a_data = tensor_a.to_gpu_format();
-        let input_b_data = tensor_b.to_gpu_format();
-
-        let input_a_buffer = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("Input A Buffer"),
-                contents: bytemuck::cast_slice(&input_a_data),
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            });
-
-        let input_b_buffer = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("Input B Buffer"),
-                contents: bytemuck::cast_slice(&input_b_data),
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            });
-
-        let output_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Output Buffer"),
-            size: (output_shape.total_elements() * std::mem::size_of::<TensorElement>()) as u64,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-
         let bind_group_layout =
             self.device
                 .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                    label: Some("Bind Group Layout"),
+                    label: Some("Binary Op Bind Group Layout"),
                     entries: &[
                         wgpu::BindGroupLayoutEntry {
                             binding: 0,
@@ -360,8 +330,34 @@ impl GpuModule {
                     ],
                 });
 
+        let input_a_data = tensor_a.to_gpu_format();
+        let input_b_data = tensor_b.to_gpu_format();
+
+        let input_a_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("Input A Buffer"),
+                contents: bytemuck::cast_slice(&input_a_data),
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            });
+
+        let input_b_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("Input B Buffer"),
+                contents: bytemuck::cast_slice(&input_b_data),
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            });
+
+        let output_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Output Buffer"),
+            size: (output_shape.total_elements() * std::mem::size_of::<TensorElement>()) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Bind Group"),
+            label: Some("Binary Op Bind Group"),
             layout: &bind_group_layout,
             entries: &[
                 wgpu::BindGroupEntry {
@@ -382,7 +378,7 @@ impl GpuModule {
         let compute_pipeline_layout =
             self.device
                 .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                    label: Some("Compute Pipeline Layout"),
+                    label: Some("Binary Op Compute Pipeline Layout"),
                     bind_group_layouts: &[&bind_group_layout],
                     push_constant_ranges: &[],
                 });
@@ -390,7 +386,7 @@ impl GpuModule {
         let compute_pipeline =
             self.device
                 .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                    label: Some("Compute Pipeline"),
+                    label: Some("Binary Op Compute Pipeline"),
                     layout: Some(&compute_pipeline_layout),
                     module: &shader_module,
                     entry_point: Some("main"),
@@ -401,12 +397,12 @@ impl GpuModule {
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("Compute Encoder"),
+                label: Some("Binary Op Compute Encoder"),
             });
 
         {
             let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("Compute Pass"),
+                label: Some("Binary Op Compute Pass"),
                 timestamp_writes: None,
             });
 
@@ -466,7 +462,6 @@ impl GpuModule {
         let output_data: Vec<f32> = result.iter().map(|x| x.value).collect();
 
         drop(data);
-
         staging_buffer.unmap();
 
         return Ok(Tensor::new(output_data, output_shape));

@@ -217,7 +217,21 @@ impl MNISTClassifier {
         let ctx = Arc::clone(&self.ctx);
 
         let model = Sequential::new()
-            .add(layers::linear(784, 128, ctx.clone()).await?) // All use same context
+            .add(layers::linear(784, 64, ctx.clone()).await?)
+            .add(layers::relu())
+            .add(layers::linear(64, 10, ctx.clone()).await?)
+            .add(layers::softmax());
+
+        self.model = Some(model);
+
+        return Ok(self);
+    }
+
+    pub async fn with_full_model(mut self) -> Result<Self, Box<dyn std::error::Error>> {
+        let ctx = Arc::clone(&self.ctx);
+
+        let model = Sequential::new()
+            .add(layers::linear(784, 128, ctx.clone()).await?)
             .add(layers::relu())
             .add(layers::linear(128, 64, ctx.clone()).await?)
             .add(layers::relu())
@@ -232,7 +246,7 @@ impl MNISTClassifier {
     pub async fn forward(
         &mut self,
         batch: &[&Image],
-    ) -> Result<Variable, Box<dyn std::error::Error>> {
+    ) -> Result<Vec<usize>, Box<dyn std::error::Error>> {
         let model = self.model.as_mut().ok_or("Model not initialized")?;
         let batch_size = batch.len();
         let mut image_data = Vec::with_capacity(batch_size * 784);
@@ -242,47 +256,59 @@ impl MNISTClassifier {
         }
 
         let input = Variable::with_grad(Tensor::new(image_data, Shape::new(vec![batch_size, 784])));
+        let output = model.forward(&input).await?;
+        let mut predictions = Vec::with_capacity(batch_size);
 
-        return model.forward(&input).await;
-    }
+        for i in 0..batch_size {
+            let start_idx = i * 10;
+            let end_idx = start_idx + 10;
+            let sample_output = &output.tensor.data[start_idx..end_idx];
 
-    pub async fn predict_single(
-        &mut self,
-        image: &Image,
-    ) -> Result<usize, Box<dyn std::error::Error>> {
-        let batch = vec![image];
-        let output = self.forward(&batch).await?;
-        let predictions = &output.tensor.data[0..10];
-        let predicted_class = predictions
-            .iter()
-            .enumerate()
-            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
-            .map(|(index, _)| index)
-            .unwrap();
+            let predicted_class = sample_output
+                .iter()
+                .enumerate()
+                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+                .map(|(index, _)| index)
+                .unwrap();
 
-        return Ok(predicted_class);
+            predictions.push(predicted_class);
+        }
+
+        return Ok(predictions);
     }
 
     pub async fn evaluate(&mut self, dataset: &Dataset) -> Result<f32, Box<dyn std::error::Error>> {
-        println!("Evaluating model... 📊");
-
         let mut correct = 0;
-        let total = dataset.images.len().min(100);
+        let total = dataset.images.len().min(60000);
+        let batch_size = 6000;
 
-        for (i, image) in dataset.images.iter().take(total).enumerate() {
-            let predicted = self.predict_single(image).await?;
-            if predicted == image.label as usize {
-                correct += 1;
+        for batch_start in (0..total).step_by(batch_size) {
+            let batch_end = (batch_start + batch_size).min(total);
+            let current_batch: Vec<&Image> = dataset
+                .images
+                .iter()
+                .skip(batch_start)
+                .take(batch_end - batch_start)
+                .collect();
+
+            println!("  Processing batch {}-{}", batch_start + 1, batch_end);
+
+            let predictions = self.forward(&current_batch).await?;
+
+            for (i, &predicted) in predictions.iter().enumerate() {
+                if predicted == current_batch[i].label as usize {
+                    correct += 1;
+                }
             }
 
-            if (i + 1) % 25 == 0 {
-                println!("  Processed {}/{} samples", i + 1, total);
-            }
+            println!("  Completed batch {}-{}", batch_start + 1, batch_end);
+
+            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
         }
 
         let accuracy = correct as f32 / total as f32;
         println!(
-            "✅ Accuracy: {:.2}% ({}/{} correct)",
+            "Accuracy: {:.2}% ({}/{} correct)",
             accuracy * 100.0,
             correct,
             total
@@ -304,8 +330,12 @@ async fn demo() -> Result<(), Box<dyn std::error::Error>> {
     println!("MNIST Neural Network Demo");
     println!();
 
-    let (train, test) = MNISTLoader::load().unwrap();
-    let mut classifier = MNISTClassifier::build_context().await?.with_model().await?;
+    let (train, _) = MNISTLoader::load().unwrap();
+    let mut classifier = MNISTClassifier::build_context()
+        .await?
+        .with_full_model()
+        .await?;
+
     let accuracy = classifier.evaluate(&train).await?;
 
     println!("\nModel summary 📈:");
