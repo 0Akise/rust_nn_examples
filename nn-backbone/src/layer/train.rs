@@ -4,8 +4,6 @@ use super::optimizer::SGD;
 use super::{GpuContext, Variable};
 use crate::autograd::{COMPUTATION_GRAPH, GRADIENT_REGISTRY};
 
-use gpu_accel::Tensor;
-
 use std::sync::Arc;
 
 use tokio::sync::Mutex;

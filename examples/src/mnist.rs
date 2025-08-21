@@ -1,5 +1,6 @@
 use gpu_accel::{Shape, Tensor};
-use nn_backbone::autograd::{GpuContext, Variable};
+use nn_backbone::autograd::gpu_context::GpuContext;
+use nn_backbone::autograd::variable::Variable;
 use nn_backbone::layer::layers;
 use nn_backbone::layer::model::Sequential;
 use nn_backbone::layer::train::SequentialTrainer;
@@ -213,14 +214,6 @@ impl MNISTClassifier {
         return Ok(Self { model: None, ctx });
     }
 
-    pub async fn reset_gpu(&mut self) -> Result<(), Box<dyn Error>> {
-        println!("🔄 Resetting GPU context...");
-
-        self.ctx.lock().await.reset().await?;
-
-        return Ok(());
-    }
-
     pub async fn with_model(mut self) -> Result<Self, Box<dyn Error>> {
         let ctx = Arc::clone(&self.ctx);
 
@@ -308,39 +301,69 @@ impl MNISTClassifier {
         let total = max_samples
             .unwrap_or(dataset.images.len())
             .min(dataset.images.len());
-        let batch_size = 200;
+
+        const SAFE_ITERATION_CHUNK: usize = 5;
+
+        let batch_size = if total <= 1000 {
+            200
+        } else if total <= 5000 {
+            500
+        } else {
+            (total / SAFE_ITERATION_CHUNK).min(1000).max(200)
+        };
+
         let iterations = (total + batch_size - 1) / batch_size;
 
         println!(
             "Evaluating {} samples with batch size {} (total {} iterations)",
             total, batch_size, iterations
         );
+        println!(
+            "  Working in chunks of {} iterations to avoid GPU overflow",
+            SAFE_ITERATION_CHUNK
+        );
 
         let mut correct = 0;
+        let mut iterations_since_reset = 0;
 
         for batch_idx in 0..iterations {
+            if iterations_since_reset >= SAFE_ITERATION_CHUNK && batch_idx < iterations - 1 {
+                println!(
+                    "  ⚠️  Approaching GPU limit after {} iterations, forcing synchronization...",
+                    iterations_since_reset
+                );
+
+                {
+                    let ctx = self.ctx.lock().await;
+                    let gpu = ctx.gpu().lock().await;
+
+                    for _ in 0..3 {
+                        let _ = gpu.device.poll(wgpu::PollType::Wait);
+                        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+                    }
+                }
+
+                iterations_since_reset = 0;
+                println!("  ✅ GPU synchronized, continuing...");
+            }
+
             let batch_start = batch_idx * batch_size;
             let batch_end = ((batch_idx + 1) * batch_size).min(total);
 
             if batch_start >= total || batch_end <= batch_start {
-                println!("⚠️ Skipping empty batch {}-{}", batch_start, batch_end);
                 continue;
             }
 
             let current_batch: Vec<&Image> =
                 dataset.images[batch_start..batch_end].iter().collect();
 
-            if current_batch.is_empty() {
-                println!("⚠️ Empty batch detected at iteration {}", batch_idx + 1);
-                continue;
-            }
-
             println!(
-                "  Processing batch {}-{} (iteration {}/{})",
+                "  Processing batch {}-{} (iteration {}/{}, chunk position {})",
                 batch_start + 1,
                 batch_end,
                 batch_idx + 1,
-                iterations
+                iterations,
+                iterations_since_reset + 1
             );
 
             let predictions = self.forward(&current_batch).await?;
@@ -349,6 +372,14 @@ impl MNISTClassifier {
                 if predicted == (current_batch[i].label as usize) {
                     correct += 1;
                 }
+            }
+
+            iterations_since_reset += 1;
+
+            {
+                let ctx = self.ctx.lock().await;
+                let gpu = ctx.gpu().lock().await;
+                let _ = gpu.device.poll(wgpu::PollType::Wait);
             }
         }
 
@@ -367,27 +398,80 @@ impl MNISTClassifier {
         &mut self,
         train_set: &Dataset,
         epochs: usize,
+        batch_size: usize,
     ) -> Result<(), Box<dyn Error>> {
+        println!(
+            "🎓 Starting training with {} epochs, batch size {}",
+            epochs, batch_size
+        );
+
         let model = self.model.take().unwrap();
         let mut trainer = SequentialTrainer::new(model, 0.01, self.ctx.clone());
-        let (train_images, train_labels) = train_set.to_tensor_data();
-        let train_inputs = Variable::with_grad(Tensor::new(
-            train_images,
-            Shape::new(vec![train_set.images.len(), 784]),
-        ));
-        let train_targets = Variable::with_grad(Tensor::new(
-            train_labels,
-            Shape::new(vec![train_set.images.len(), 10]),
-        ));
 
         for epoch in 0..epochs {
-            let train_loss = trainer.train_step(&train_inputs, &train_targets).await?;
+            println!("\n📚 Epoch {}/{}", epoch + 1, epochs);
 
-            println!("Epoch {}: Train Loss = {:.4}", epoch + 1, train_loss);
+            let mut epoch_loss = 0.0;
+            let num_batches = (train_set.images.len() + batch_size - 1) / batch_size;
+            let mut processed_batches = 0;
+
+            for batch_idx in 0..num_batches {
+                if processed_batches > 0 && processed_batches % 3 == 0 {
+                    println!("  🔄 GPU sync after {} batches", processed_batches);
+                    let ctx = self.ctx.lock().await;
+                    let gpu = ctx.gpu().lock().await;
+                    let _ = gpu.device.poll(wgpu::PollType::Wait);
+                    drop(gpu);
+                    drop(ctx);
+                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                }
+
+                let start = batch_idx * batch_size;
+                let end = ((batch_idx + 1) * batch_size).min(train_set.images.len());
+
+                let batch_images: Vec<f32> = train_set.images[start..end]
+                    .iter()
+                    .flat_map(|img| img.to_normalized())
+                    .collect();
+
+                let batch_labels: Vec<f32> = train_set.images[start..end]
+                    .iter()
+                    .flat_map(|img| img.to_one_hot())
+                    .collect();
+
+                let batch_inputs = Variable::with_grad(Tensor::new(
+                    batch_images,
+                    Shape::new(vec![end - start, 784]),
+                ));
+
+                let batch_targets = Variable::with_grad(Tensor::new(
+                    batch_labels,
+                    Shape::new(vec![end - start, 10]),
+                ));
+
+                println!(
+                    "  Batch {}/{}: samples {}-{}",
+                    batch_idx + 1,
+                    num_batches,
+                    start + 1,
+                    end
+                );
+
+                let loss = trainer.train_step(&batch_inputs, &batch_targets).await?;
+                epoch_loss += loss;
+                processed_batches += 1;
+
+                println!("    Loss: {:.4}", loss);
+            }
+
+            println!(
+                "  Epoch {} complete - Average Loss: {:.4}",
+                epoch + 1,
+                epoch_loss / num_batches as f32
+            );
         }
 
         self.model = Some(trainer.model);
-
         Ok(())
     }
 }
@@ -398,7 +482,8 @@ async fn demo() -> Result<(), Box<dyn Error>> {
 
     let (train, test) = MNISTLoader::load().unwrap();
     let mut classifier = MNISTClassifier::build_context().await?.with_model().await?;
-    let accuracy_init = classifier.evaluate(&test, Some(6000)).await?;
+    let test_samples = 1000;
+    let accuracy_init = classifier.evaluate(&test, Some(test_samples)).await?;
 
     println!("\nModel summary 📈:");
     println!(
@@ -407,7 +492,8 @@ async fn demo() -> Result<(), Box<dyn Error>> {
     );
 
     let train_epochs = 5;
-    let train_subset = 10000;
+    let train_subset = 2000;
+    let batch_size = 100;
     let mut small_train = Dataset::new();
 
     small_train.images = train.images.into_iter().take(train_subset).collect();
@@ -420,7 +506,9 @@ async fn demo() -> Result<(), Box<dyn Error>> {
         valid_set.images.len()
     );
 
-    classifier.train(&train_set, train_epochs).await?;
+    classifier
+        .train(&train_set, train_epochs, batch_size)
+        .await?;
 
     let accuracy_learned = classifier.evaluate(&test, Some(1000)).await?;
 

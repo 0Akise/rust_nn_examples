@@ -1,5 +1,5 @@
-use super::Variable;
 use crate::autograd::backward::BackwardCrossEntropy;
+use crate::autograd::variable::Variable;
 use crate::autograd::BackwardFn;
 
 use gpu_accel::{Shape, Tensor};

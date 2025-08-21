@@ -5,7 +5,8 @@ pub mod model;
 pub mod optimizer;
 pub mod train;
 
-use super::autograd::{GpuContext, Variable};
+use crate::autograd::gpu_context::GpuContext;
+use crate::autograd::variable::Variable;
 use activation::{ReLU, Softmax};
 use linear::Linear;
 

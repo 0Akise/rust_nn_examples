@@ -10,9 +10,18 @@ pollster = { workspace = true }
 wgpu = { workspace = true }
 tokio = { version = "1.0", features = ["full"] }
 
+
 [[bin]]
-name = "expression"
-path = "src/expression.rs"
+name = "t_gpu"
+path = "src/t_gpu.rs"
+
+[[bin]]
+name = "t_seq"
+path = "src/t_seq.rs"
+
+[[bin]]
+name = "t_grad"
+path = "src/t_grad.rs"
 
 [[bin]]
 name = "tensor_ops"

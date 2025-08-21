@@ -1,4 +1,5 @@
-use super::{GpuContext, Variable};
+use crate::autograd::gpu_context::GpuContext;
+use crate::autograd::variable::Variable;
 
 use gpu_accel::{Shape, Tensor};
 

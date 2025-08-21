@@ -1,4 +1,4 @@
-use super::Variable;
+use crate::autograd::variable::Variable;
 
 pub struct SGD {
     pub learning_rate: f32,

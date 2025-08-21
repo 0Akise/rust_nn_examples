@@ -1,5 +1,5 @@
-use super::Variable;
 use crate::autograd::backward::{BackwardReLU, BackwardSoftmax};
+use crate::autograd::variable::Variable;
 use crate::autograd::BackwardFn;
 
 use gpu_accel::Tensor;

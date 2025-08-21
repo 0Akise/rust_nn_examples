@@ -1,4 +1,5 @@
-use super::{Layer, Variable};
+use crate::autograd::variable::Variable;
+use crate::layer::Layer;
 
 use std::error::Error;
 
