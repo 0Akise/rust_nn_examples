@@ -3,7 +3,36 @@ members = ["gpu-accel", "nn-backbone", "examples"]
 resolver = "2"
 
 [workspace.dependencies]
-wgpu = "26.0.1"
-bytemuck = "1.0"
-pollster = "0.4.0"
-flume = "0.11"
+# Enhanced Async Runtime
+tokio = { version = "*", features = ["full", "tracing"] }
+console-subscriber = "*"
+futures = "*"
+crossbeam = "*"
+dashmap = "*"
+
+# Core GPU
+wgpu = "*"
+bytemuck = { version = "*", features = ["derive"] }
+pollster = "*"
+flume = "*"
+
+# GPU Management
+gpu-allocator = "*"
+wgpu-profiler = "*"
+gpu-descriptor = "*"
+
+# Error Handling
+thiserror = "*"
+anyhow = "*"
+timeout-readwrite = "*"
+
+# Logging/Tracing
+tracing = { version = "*", features = ["max_level_trace"] }
+tracing-subscriber = { version = "*", features = ["env-filter", "json"] }
+tracing-futures = "*"
+
+# System Monitoring
+metrics = "*"
+metrics-exporter-prometheus = "*"
+sysinfo = "*"
+watch = "*"

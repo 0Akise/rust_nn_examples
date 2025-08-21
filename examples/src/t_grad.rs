@@ -1,6 +1,3 @@
-// Create examples/src/test_simple_grad.rs
-// This tests if gradients work at all
-
 use gpu_accel::{Shape, Tensor};
 use nn_backbone::autograd::gpu_context::GpuContext;
 use nn_backbone::autograd::variable::Variable;

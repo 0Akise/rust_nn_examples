@@ -1,4 +1,5 @@
 pub mod gpu_module;
+pub mod renewal;
 pub mod shader_manager;
 
 use gpu_module::GpuModule;

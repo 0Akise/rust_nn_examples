@@ -5,10 +5,35 @@ edition = "2021"
 description = "simple GPU Backbone for examples"
 
 [dependencies]
-wgpu = { workspace = true }
-bytemuck = { workspace = true, features = ["derive"] }
-flume = { workspace = true }
-rand = "*"
+# Enhanced Async Runtime
+tokio = { version = "*", features = ["full", "tracing"] }
+console-subscriber = "*"
+futures = "*"
+crossbeam = "*"
+dashmap = "*"
 
-[dev-dependencies]
-pollster = { workspace = true }
+# Core GPU
+wgpu = "*"
+bytemuck = { version = "*", features = ["derive"] }
+pollster = "*"
+flume = "*"
+
+# GPU Management
+gpu-allocator = "*"
+wgpu-profiler = "*"
+gpu-descriptor = "*"
+
+# Error Handling
+thiserror = "*"
+anyhow = "*"
+timeout-readwrite = "*"
+
+# Logging/Tracing
+tracing = { version = "*", features = ["max_level_trace"] }
+tracing-subscriber = { version = "*", features = ["env-filter", "json"] }
+tracing-futures = "*"
+
+# System Monitoring
+metrics = "*"
+metrics-exporter-prometheus = "*"
+sysinfo = "*"

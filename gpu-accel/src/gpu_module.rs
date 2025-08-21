@@ -1,11 +1,12 @@
-use super::shader_manager::ShaderManager;
-use super::{Operation, Shape, Tensor, TensorElement};
+use crate::shader_manager::ShaderManager;
+use crate::{Operation, Shape, Tensor, TensorElement};
 
 use std::collections::HashMap;
 use std::error::Error;
 use std::sync::Arc;
 
-use wgpu::{util::DeviceExt, Adapter, BindGroupLayout, ComputePipeline, Device, Queue};
+use wgpu::util::DeviceExt;
+use wgpu::{Adapter, BindGroupLayout, ComputePipeline, Device, Queue};
 
 #[derive(Debug, Clone)]
 pub struct GpuInfo {

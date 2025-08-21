@@ -1,6 +1,3 @@
-// Create examples/src/test_sequential.rs
-// This tests if Sequential model properly builds computation graph
-
 use gpu_accel::{Shape, Tensor};
 use nn_backbone::autograd::gpu_context::GpuContext;
 use nn_backbone::autograd::variable::Variable;

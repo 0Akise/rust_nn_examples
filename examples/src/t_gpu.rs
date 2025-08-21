@@ -1,6 +1,3 @@
-// In examples/src/test_backward.rs
-// Fixed version with proper loss computation
-
 use gpu_accel::{Shape, Tensor};
 use nn_backbone::autograd::gpu_context::GpuContext;
 use nn_backbone::autograd::variable::Variable;
