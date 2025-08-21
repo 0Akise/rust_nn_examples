@@ -1,12 +1,13 @@
 use std::collections::VecDeque;
 use std::error::Error;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8};
+use std::mem::ManuallyDrop;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{atomic::AtomicUsize, Arc};
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use tokio::sync::{mpsc, oneshot, watch};
-use wgpu::{AdapterInfo, BufferUsages, CommandBuffer, Device, Queue};
+use wgpu::{Adapter, AdapterInfo, BufferUsages, CommandBuffer, Device, DeviceType, Limits, Queue};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct OperationId(u64);
@@ -122,12 +123,353 @@ pub enum GpuError {
     CircuitBreakerOpen { failures: usize },
 }
 
+#[derive(Debug)]
 pub struct ResourceLimits {
     pub max_concurrent_operations: usize,
     pub max_command_buffers: usize,
     pub max_memory_usage_mb: usize,
     pub operation_timeout: Duration,
     pub queue_depth_limit: usize,
+}
+
+impl ResourceLimits {
+    fn estimate_safe_memory_mb(limits: &Limits) -> usize {
+        let max_buffer_bytes = limits.max_buffer_size as usize;
+        let safe_bytes = (max_buffer_bytes as f64 * 0.75) as usize;
+
+        return safe_bytes / (1024 * 1024);
+    }
+
+    pub fn generic() -> Self {
+        return Self {
+            max_concurrent_operations: 8,
+            max_command_buffers: 16,
+            max_memory_usage_mb: 1024,
+            operation_timeout: Duration::from_secs(10),
+            queue_depth_limit: 32,
+        };
+    }
+
+    fn amd(limits: &Limits) -> Self {
+        return Self {
+            max_concurrent_operations: 4,
+            max_command_buffers: 16,
+            max_memory_usage_mb: Self::estimate_safe_memory_mb(limits),
+            operation_timeout: Duration::from_secs(10),
+            queue_depth_limit: 16,
+        };
+    }
+
+    fn amd_high(limits: &Limits) -> Self {
+        return Self {
+            max_concurrent_operations: 4, // HSA_MAX_QUEUES=4
+            max_command_buffers: 32,
+            max_memory_usage_mb: Self::estimate_safe_memory_mb(limits),
+            operation_timeout: Duration::from_secs(10),
+            queue_depth_limit: 16,
+        };
+    }
+
+    fn nvidia(limits: &Limits) -> Self {
+        return Self {
+            max_concurrent_operations: 12,
+            max_command_buffers: 24,
+            max_memory_usage_mb: Self::estimate_safe_memory_mb(limits),
+            operation_timeout: Duration::from_secs(10),
+            queue_depth_limit: 48,
+        };
+    }
+
+    pub fn autotune(adapter: &Adapter) -> Self {
+        let info = adapter.get_info();
+        let limits = adapter.limits();
+
+        match (info.device_type, info.vendor) {
+            (DeviceType::DiscreteGpu, 0x1002) => {
+                if info.name.contains("7900") {
+                    return Self::amd_high(&limits);
+                } else {
+                    return Self::amd(&limits);
+                }
+            }
+            (DeviceType::DiscreteGpu, 0x10DE) => {
+                return Self::nvidia(&limits);
+            }
+            _ => {
+                return Self::generic();
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct ResourceTracker {
+    limits: ResourceLimits,
+    current_operations: AtomicUsize,
+    current_command_buffers: AtomicUsize,
+    current_memory_usage_mb: AtomicUsize,
+    queue_depth: AtomicUsize,
+    emergency_stop: AtomicBool,
+}
+
+#[derive(Debug)]
+pub struct ResourceUsage {
+    pub gpu_operations: usize, // Operations currently executing on GPU
+    pub command_buffers: usize,
+    pub memory_usage_mb: usize,
+    pub total_queue_depth: usize, // Total operations in system (executing + waiting)
+}
+
+impl ResourceTracker {
+    pub fn new(limits: ResourceLimits) -> Result<Self, String> {
+        return Ok(Self {
+            limits,
+            current_operations: AtomicUsize::new(0),
+            current_command_buffers: AtomicUsize::new(0),
+            current_memory_usage_mb: AtomicUsize::new(0),
+            queue_depth: AtomicUsize::new(0),
+            emergency_stop: AtomicBool::new(false),
+        });
+    }
+
+    pub fn can_start_gpu_execution(&self) -> Result<(), GpuError> {
+        if self.emergency_stop.load(Ordering::Acquire) {
+            return Err(GpuError::CircuitBreakerOpen { failures: 0 });
+        }
+
+        let current_ops = self.current_operations.load(Ordering::Acquire);
+
+        if current_ops >= self.limits.max_concurrent_operations {
+            return Err(GpuError::QueueOverflow {
+                active: current_ops,
+                limit: self.limits.max_concurrent_operations,
+            });
+        }
+
+        return Ok(());
+    }
+
+    pub fn can_queue_operation(&self) -> Result<(), GpuError> {
+        if self.emergency_stop.load(Ordering::Acquire) {
+            return Err(GpuError::CircuitBreakerOpen { failures: 0 });
+        }
+
+        let queue_depth = self.queue_depth.load(Ordering::Acquire);
+
+        if queue_depth >= self.limits.queue_depth_limit {
+            return Err(GpuError::QueueOverflow {
+                active: queue_depth,
+                limit: self.limits.queue_depth_limit,
+            });
+        }
+
+        return Ok(());
+    }
+
+    pub fn can_allocate_command_buffer(&self) -> Result<(), GpuError> {
+        let current = self.current_command_buffers.load(Ordering::Acquire);
+
+        if current >= self.limits.max_command_buffers {
+            return Err(GpuError::QueueOverflow {
+                active: current,
+                limit: self.limits.max_command_buffers,
+            });
+        }
+
+        return Ok(());
+    }
+
+    pub fn can_allocate_memory(&self, size_mb: usize) -> Result<(), GpuError> {
+        let current = self.current_memory_usage_mb.load(Ordering::Acquire);
+        let new_total = current + size_mb;
+
+        if new_total > self.limits.max_memory_usage_mb {
+            return Err(GpuError::MemoryExhaustion {
+                requested: size_mb,
+                available: self.limits.max_memory_usage_mb.saturating_sub(current),
+            });
+        }
+
+        return Ok(());
+    }
+
+    pub fn start_gpu_execution(
+        &'_ self,
+        _queue_guard: &QueueSlotGuard,
+    ) -> Result<GpuExecutionGuard<'_>, GpuError> {
+        self.can_start_gpu_execution()?;
+
+        let prev_ops = self.current_operations.fetch_add(1, Ordering::AcqRel);
+
+        if prev_ops >= self.limits.max_concurrent_operations {
+            self.current_operations.fetch_sub(1, Ordering::AcqRel);
+
+            return Err(GpuError::QueueOverflow {
+                active: prev_ops + 1,
+                limit: self.limits.max_concurrent_operations,
+            });
+        }
+
+        return Ok(GpuExecutionGuard {
+            tracker: self,
+            _phantom: std::marker::PhantomData,
+        });
+    }
+
+    pub fn reserve_queue_slot(&'_ self) -> Result<QueueSlotGuard<'_>, GpuError> {
+        self.can_queue_operation()?;
+
+        let prev_queue = self.queue_depth.fetch_add(1, Ordering::AcqRel);
+
+        if prev_queue >= self.limits.queue_depth_limit {
+            self.queue_depth.fetch_sub(1, Ordering::AcqRel);
+            return Err(GpuError::QueueOverflow {
+                active: prev_queue + 1,
+                limit: self.limits.queue_depth_limit,
+            });
+        }
+
+        return Ok(QueueSlotGuard {
+            tracker: self,
+            _phantom: std::marker::PhantomData,
+        });
+    }
+
+    pub fn reserve_operation(&'_ self) -> Result<OperationGuard<'_>, GpuError> {
+        let queue_guard = self.reserve_queue_slot()?;
+        let gpu_guard = self.start_gpu_execution(&queue_guard)?;
+
+        return Ok(OperationGuard {
+            queue_guard,
+            gpu_guard,
+        });
+    }
+
+    pub fn reserve_command_buffer(&'_ self) -> Result<CommandBufferGuard<'_>, GpuError> {
+        self.can_allocate_command_buffer()?;
+
+        let prev = self.current_command_buffers.fetch_add(1, Ordering::AcqRel);
+
+        if prev >= self.limits.max_command_buffers {
+            self.current_command_buffers.fetch_sub(1, Ordering::AcqRel);
+
+            return Err(GpuError::QueueOverflow {
+                active: prev + 1,
+                limit: self.limits.max_command_buffers,
+            });
+        }
+
+        return Ok(CommandBufferGuard {
+            tracker: self,
+            _phantom: std::marker::PhantomData,
+        });
+    }
+
+    pub fn reserve_memory(&'_ self, size_mb: usize) -> Result<MemoryGuard<'_>, GpuError> {
+        self.can_allocate_memory(size_mb)?;
+
+        self.current_memory_usage_mb
+            .fetch_add(size_mb, Ordering::AcqRel);
+
+        return Ok(MemoryGuard {
+            tracker: self,
+            size_mb,
+            _phantom: std::marker::PhantomData,
+        });
+    }
+
+    pub fn current_usage(&self) -> ResourceUsage {
+        return ResourceUsage {
+            gpu_operations: self.current_operations.load(Ordering::Acquire),
+            command_buffers: self.current_command_buffers.load(Ordering::Acquire),
+            memory_usage_mb: self.current_memory_usage_mb.load(Ordering::Acquire),
+            total_queue_depth: self.queue_depth.load(Ordering::Acquire),
+        };
+    }
+
+    pub fn emergency_stop_trigger(&self) {
+        self.emergency_stop.store(true, Ordering::Release);
+    }
+
+    pub fn emergency_stop_reset(&self) {
+        self.emergency_stop.store(false, Ordering::Release);
+    }
+
+    pub fn get_operation_timeout(&self) -> Duration {
+        return self.limits.operation_timeout;
+    }
+}
+
+/// RAII guard for queue slot reservation
+pub struct QueueSlotGuard<'a> {
+    tracker: &'a ResourceTracker,
+    _phantom: std::marker::PhantomData<&'a ()>,
+}
+
+impl<'a> Drop for QueueSlotGuard<'a> {
+    fn drop(&mut self) {
+        self.tracker.queue_depth.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// RAII guard for GPU execution
+pub struct GpuExecutionGuard<'a> {
+    tracker: &'a ResourceTracker,
+    _phantom: std::marker::PhantomData<&'a ()>,
+}
+
+impl<'a> Drop for GpuExecutionGuard<'a> {
+    fn drop(&mut self) {
+        self.tracker
+            .current_operations
+            .fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// RAII guard for complete operation (queue + GPU execution)
+pub struct OperationGuard<'a> {
+    queue_guard: QueueSlotGuard<'a>,
+    gpu_guard: GpuExecutionGuard<'a>,
+}
+
+impl<'a> OperationGuard<'a> {
+    pub fn split(self) -> (QueueSlotGuard<'a>, GpuExecutionGuard<'a>) {
+        let manual = ManuallyDrop::new(self);
+
+        let queue_guard = unsafe { std::ptr::read(&manual.queue_guard) };
+        let gpu_guard = unsafe { std::ptr::read(&manual.gpu_guard) };
+
+        return (queue_guard, gpu_guard);
+    }
+}
+
+/// RAII guard for command buffer
+pub struct CommandBufferGuard<'a> {
+    tracker: &'a ResourceTracker,
+    _phantom: std::marker::PhantomData<&'a ()>,
+}
+
+impl<'a> Drop for CommandBufferGuard<'a> {
+    fn drop(&mut self) {
+        self.tracker
+            .current_command_buffers
+            .fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// RAII guard for memory
+pub struct MemoryGuard<'a> {
+    tracker: &'a ResourceTracker,
+    size_mb: usize,
+    _phantom: std::marker::PhantomData<&'a ()>,
+}
+
+impl<'a> Drop for MemoryGuard<'a> {
+    fn drop(&mut self) {
+        self.tracker
+            .current_memory_usage_mb
+            .fetch_sub(self.size_mb, Ordering::AcqRel);
+    }
 }
 
 pub struct ActiveCommandBuffer {

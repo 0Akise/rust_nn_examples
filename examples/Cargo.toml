@@ -9,7 +9,8 @@ nn-backbone = { path = "../nn-backbone" }
 pollster = { workspace = true }
 wgpu = { workspace = true }
 tokio = { version = "1.0", features = ["full"] }
-
+flume = { workspace = true }
+bytemuck = { workspace = true }
 
 [[bin]]
 name = "t_gpu"

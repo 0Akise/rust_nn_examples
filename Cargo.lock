@@ -1423,6 +1423,8 @@ dependencies = [
 name = "nn-examples"
 version = "0.1.0"
 dependencies = [
+ "bytemuck",
+ "flume",
  "gpu-accel",
  "nn-backbone",
  "pollster",
