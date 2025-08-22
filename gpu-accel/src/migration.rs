@@ -1,12 +1,14 @@
 use std::collections::VecDeque;
-use std::error::Error;
 use std::mem::ManuallyDrop;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{atomic::AtomicUsize, Arc};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use dashmap::DashMap;
+use tokio::sync::Semaphore;
 use tokio::sync::{mpsc, oneshot, watch};
+use tokio::time::{sleep, timeout};
+use tracing::{debug, error, info, warn};
 use wgpu::{
     Adapter, AdapterInfo, BufferUsages, CommandBuffer, CommandEncoder, CommandEncoderDescriptor,
     Device, DeviceType, Limits, Queue,
@@ -39,7 +41,7 @@ pub struct Shape {
 }
 
 #[derive(Debug, Clone)]
-pub struct TensorData {
+pub struct Tensor {
     pub data: Arc<Vec<f32>>,
     pub shape: Shape,
 }
@@ -47,42 +49,6 @@ pub struct TensorData {
 //
 // GPU
 //
-
-#[derive(Debug, Clone)]
-pub enum GradientTask {
-    // lightweight and contain only data needed for the specific operation
-    Add {
-        output_grad: TensorData,
-        target_var: VariableId,
-        operation_id: OperationId,
-    },
-    Mul {
-        output_grad: TensorData,
-        other_input: TensorData,
-        target_var: VariableId,
-        operation_id: OperationId,
-    },
-    MatMul {
-        output_grad: TensorData,
-        other_input: TensorData,
-        transpose_other: bool,
-        target_var: VariableId,
-        operation_id: OperationId,
-    },
-    Transpose {
-        output_grad: TensorData,
-        target_var: VariableId,
-        operation_id: OperationId,
-    },
-}
-
-#[derive(Debug, Clone)]
-pub enum TaskStatus {
-    Success,
-    Failed(String),
-    Timeout,
-    Cancelled,
-}
 
 #[derive(Debug, Clone)]
 pub enum AllocationStrategy {
@@ -102,7 +68,7 @@ pub enum AccumulationStrategy {
 
 #[derive(Debug)]
 pub enum ComputationResult {
-    Tensor(TensorData),
+    Tensor(Tensor),
     Scalar(f32),
     Error(String),
     Pending,
@@ -813,6 +779,14 @@ impl<'a> Drop for ManagedEncoder<'a> {
     }
 }
 
+#[derive(Debug, Clone)]
+pub enum TaskStatus {
+    Success,
+    Failed(String),
+    TimedOut,
+    Cancelled,
+}
+
 #[derive(Debug)]
 pub struct TaskCompletion {
     pub operation_id: OperationId,
@@ -822,21 +796,864 @@ pub struct TaskCompletion {
     pub gradient_norm: Option<f32>,
 }
 
+impl TaskCompletion {
+    /// Create a successful task completion
+    pub fn success(
+        operation_id: OperationId,
+        variable_id: VariableId,
+        duration: Duration,
+        gradient_norm: Option<f32>,
+    ) -> Self {
+        return Self {
+            operation_id,
+            variable_id,
+            status: TaskStatus::Success,
+            duration,
+            gradient_norm,
+        };
+    }
+
+    /// Create a failed task completion
+    pub fn failed(
+        operation_id: OperationId,
+        variable_id: VariableId,
+        duration: Duration,
+        error: String,
+    ) -> Self {
+        return Self {
+            operation_id,
+            variable_id,
+            status: TaskStatus::Failed(error),
+            duration,
+            gradient_norm: None,
+        };
+    }
+
+    /// Create a timeout task completion
+    pub fn timed_out(
+        operation_id: OperationId,
+        variable_id: VariableId,
+        duration: Duration,
+    ) -> Self {
+        return Self {
+            operation_id,
+            variable_id,
+            status: TaskStatus::TimedOut,
+            duration,
+            gradient_norm: None,
+        };
+    }
+
+    /// Create a cancelled task completion
+    pub fn cancelled(
+        operation_id: OperationId,
+        variable_id: VariableId,
+        duration: Duration,
+    ) -> Self {
+        return Self {
+            operation_id,
+            variable_id,
+            status: TaskStatus::Cancelled,
+            duration,
+            gradient_norm: None,
+        };
+    }
+
+    pub fn is_success(&self) -> bool {
+        return matches!(self.status, TaskStatus::Success);
+    }
+
+    pub fn is_failed(&self) -> bool {
+        return !self.is_success();
+    }
+
+    pub fn is_system_failure(&self) -> bool {
+        matches!(self.status, TaskStatus::TimedOut | TaskStatus::Cancelled)
+    }
+
+    pub fn get_error_message(&self) -> Option<&str> {
+        match &self.status {
+            TaskStatus::Failed(msg) => Some(msg),
+            TaskStatus::TimedOut => Some("Operation timed out"),
+            TaskStatus::Cancelled => Some("Operation was cancelled"),
+            TaskStatus::Success => None,
+        }
+    }
+
+    pub fn has_gradient_issues(&self) -> bool {
+        match self.gradient_norm {
+            Some(norm) => norm.is_nan() || norm.is_infinite() || norm < 1e-7,
+            None => false,
+        }
+    }
+
+    pub fn from_timed_result<T, E>(
+        operation_id: OperationId,
+        variable_id: VariableId,
+        start_time: Instant,
+        result: Result<T, E>,
+        gradient_norm: Option<f32>,
+    ) -> Self
+    where
+        E: std::fmt::Display,
+    {
+        let duration = start_time.elapsed();
+
+        match result {
+            Ok(_) => Self::success(operation_id, variable_id, duration, gradient_norm),
+            Err(e) => Self::failed(operation_id, variable_id, duration, e.to_string()),
+        }
+    }
+
+    pub fn log(&self) {
+        match &self.status {
+            TaskStatus::Success => {
+                if let Some(norm) = self.gradient_norm {
+                    if self.has_gradient_issues() {
+                        warn!(
+                            operation_id = ?self.operation_id,
+                            variable_id = ?self.variable_id,
+                            duration_ms = self.duration.as_millis(),
+                            gradient_norm = norm,
+                            "Task completed with gradient issues"
+                        );
+                    } else {
+                        debug!(
+                            operation_id = ?self.operation_id,
+                            variable_id = ?self.variable_id,
+                            duration_ms = self.duration.as_millis(),
+                            gradient_norm = norm,
+                            "Task completed successfully"
+                        );
+                    }
+                } else {
+                    debug!(
+                        operation_id = ?self.operation_id,
+                        variable_id = ?self.variable_id,
+                        duration_ms = self.duration.as_millis(),
+                        "Task completed successfully"
+                    );
+                }
+            }
+            TaskStatus::Failed(error) => {
+                error!(
+                    operation_id = ?self.operation_id,
+                    variable_id = ?self.variable_id,
+                    duration_ms = self.duration.as_millis(),
+                    error = error,
+                    "Task failed"
+                );
+            }
+            TaskStatus::TimedOut => {
+                error!(
+                    operation_id = ?self.operation_id,
+                    variable_id = ?self.variable_id,
+                    duration_ms = self.duration.as_millis(),
+                    "Task timed out"
+                );
+            }
+            TaskStatus::Cancelled => {
+                warn!(
+                    operation_id = ?self.operation_id,
+                    variable_id = ?self.variable_id,
+                    duration_ms = self.duration.as_millis(),
+                    "Task was cancelled"
+                );
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CircuitBreakerState {
+    Closed = 0,   // Normal operation
+    Open = 1,     // Failing, blocking requests
+    HalfOpen = 2, // Testing recovery
+}
+
+impl From<u8> for CircuitBreakerState {
+    fn from(value: u8) -> Self {
+        match value {
+            0 => CircuitBreakerState::Closed,
+            1 => CircuitBreakerState::Open,
+            2 => CircuitBreakerState::HalfOpen,
+            _ => CircuitBreakerState::Closed,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct CircuitBreakerStats {
+    pub state: CircuitBreakerState,
+    pub failure_count: usize,
+    pub total_requests: usize,
+    pub successful_requests: usize,
+    pub rejected_requests: usize,
+    pub success_rate: f64,
+    pub time_in_current_state: Duration,
+}
+
+impl CircuitBreakerStats {
+    /// Check if the circuit breaker stats indicate problems
+    pub fn indicates_problems(&self) -> bool {
+        match self.state {
+            CircuitBreakerState::Open => true,
+            CircuitBreakerState::HalfOpen => Duration::from_secs(60) < self.time_in_current_state,
+            CircuitBreakerState::Closed => (self.success_rate < 0.8) && (10 < self.total_requests),
+        }
+    }
+}
+
+pub struct CircuitBreaker {
+    state: AtomicU8,
+    total_requests: AtomicUsize,
+    successful_requests: AtomicUsize,
+    failure_count: AtomicUsize,
+    last_failure: AtomicU64,
+    failure_threshold: usize,
+    rejected_requests: AtomicUsize,
+    recovery_timeout: Duration,
+    last_state_change: AtomicU64,
+}
+
+impl CircuitBreaker {
+    pub fn new(failure_threshold: usize, recovery_timeout: Duration) -> Self {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        return Self {
+            state: AtomicU8::new(CircuitBreakerState::Closed as u8),
+            total_requests: AtomicUsize::new(0),
+            successful_requests: AtomicUsize::new(0),
+            failure_count: AtomicUsize::new(0),
+            last_failure: AtomicU64::new(0),
+            failure_threshold,
+            rejected_requests: AtomicUsize::new(0),
+            recovery_timeout,
+            last_state_change: AtomicU64::new(now),
+        };
+    }
+
+    pub fn for_gpu_operations() -> Self {
+        return Self::new(5, Duration::from_secs(10));
+    }
+
+    /// Check if circuit breaker should attempt recovery
+    fn should_attempt_recovery(&self) -> bool {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let last_failure = self.last_failure.load(Ordering::Acquire);
+        let time_since_failure = Duration::from_secs(now.saturating_sub(last_failure));
+
+        return self.recovery_timeout <= time_since_failure;
+    }
+
+    /// Get current circuit breaker state
+    pub fn get_state(&self) -> CircuitBreakerState {
+        CircuitBreakerState::from(self.state.load(Ordering::Acquire))
+    }
+
+    /// Get time spent in current state
+    fn get_time_in_current_state(&self) -> Duration {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let last_change = self.last_state_change.load(Ordering::Relaxed);
+        Duration::from_secs(now.saturating_sub(last_change))
+    }
+
+    pub fn get_stats(&self) -> CircuitBreakerStats {
+        let total = self.total_requests.load(Ordering::Relaxed);
+        let successful = self.successful_requests.load(Ordering::Relaxed);
+        let rejected = self.rejected_requests.load(Ordering::Relaxed);
+        let success_rate;
+
+        if 0 < total {
+            success_rate = (successful as f64) / (total as f64)
+        } else {
+            success_rate = 0.0
+        };
+
+        return CircuitBreakerStats {
+            state: self.get_state(),
+            failure_count: self.failure_count.load(Ordering::Relaxed),
+            total_requests: total,
+            successful_requests: successful,
+            rejected_requests: rejected,
+            success_rate,
+            time_in_current_state: self.get_time_in_current_state(),
+        };
+    }
+
+    /// Update the last state change timestamp
+    fn update_state_change_time(&self) {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        self.last_state_change.store(now, Ordering::Relaxed);
+    }
+
+    fn open(&self) {
+        self.state
+            .store(CircuitBreakerState::Open as u8, Ordering::Release);
+        self.update_state_change_time();
+    }
+
+    fn open_half(&self) {
+        self.state
+            .store(CircuitBreakerState::HalfOpen as u8, Ordering::Release);
+        self.update_state_change_time();
+
+        tracing::info!("Circuit breaker transitioning to HALF_OPEN");
+    }
+
+    fn close(&self) {
+        self.state
+            .store(CircuitBreakerState::Closed as u8, Ordering::Release);
+        self.failure_count.store(0, Ordering::Relaxed);
+        self.update_state_change_time();
+    }
+
+    pub fn force_open(&self) {
+        self.open();
+
+        tracing::error!("Circuit breaker FORCE OPENED");
+    }
+
+    pub fn force_close(&self) {
+        self.close();
+
+        tracing::info!("Circuit breaker FORCE CLOSED");
+    }
+
+    pub fn is_request_allowed(&self) -> bool {
+        self.total_requests.fetch_add(1, Ordering::Relaxed);
+
+        let current_state = self.get_state();
+
+        match current_state {
+            CircuitBreakerState::Closed => true,
+            CircuitBreakerState::Open => {
+                if self.should_attempt_recovery() {
+                    self.open_half();
+
+                    return true;
+                } else {
+                    self.rejected_requests.fetch_add(1, Ordering::Relaxed);
+
+                    return false;
+                }
+            }
+            CircuitBreakerState::HalfOpen => {
+                return true;
+            }
+        }
+    }
+
+    /// Record a successful operation
+    pub fn record_success(&self) {
+        self.successful_requests.fetch_add(1, Ordering::Relaxed);
+
+        let current_state = self.get_state();
+
+        match current_state {
+            CircuitBreakerState::Closed => {
+                self.failure_count.store(0, Ordering::Relaxed);
+            }
+            CircuitBreakerState::HalfOpen => {
+                self.close();
+
+                tracing::info!("Circuit breaker recovered, transitioning to CLOSED state");
+            }
+            CircuitBreakerState::Open => {
+                tracing::warn!("Received success in OPEN state, this shouldn't happen");
+
+                self.close();
+            }
+        }
+    }
+
+    /// Record a failed operation
+    pub fn record_failure(&self) {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        self.last_failure.store(now, Ordering::Relaxed);
+
+        let new_failure_count = self.failure_count.fetch_add(1, Ordering::Relaxed) + 1;
+        let current_state = self.get_state();
+
+        match current_state {
+            CircuitBreakerState::Closed => {
+                if new_failure_count >= self.failure_threshold {
+                    self.open();
+
+                    tracing::error!(
+                        failure_count = new_failure_count,
+                        threshold = self.failure_threshold,
+                        "Circuit breaker OPENED due to consecutive failures"
+                    );
+                }
+            }
+            CircuitBreakerState::HalfOpen => {
+                self.open();
+
+                tracing::warn!("Circuit breaker recovery failed, returning to OPEN state");
+            }
+            CircuitBreakerState::Open => {}
+        }
+    }
+
+    pub fn is_healthy(&self) -> bool {
+        matches!(self.get_state(), CircuitBreakerState::Closed)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum GradientTask {
+    // be lightweight and contain only data needed for the specific operation
+    Add {
+        output_grad: Tensor,
+        target_variable: VariableId,
+        operation_id: OperationId,
+    },
+    Mul {
+        output_grad: Tensor,
+        other_input: Tensor,
+        target_variable: VariableId,
+        operation_id: OperationId,
+    },
+    MatMul {
+        output_grad: Tensor,
+        other_input: Tensor,
+        transpose_other: bool,
+        target_variable: VariableId,
+        operation_id: OperationId,
+    },
+    Transpose {
+        output_grad: Tensor,
+        target_variable: VariableId,
+        operation_id: OperationId,
+    },
+}
+
+impl GradientTask {
+    /// Get the operation ID for this task
+    pub fn get_operation_id(&self) -> OperationId {
+        match self {
+            GradientTask::Add { operation_id, .. } => *operation_id,
+            GradientTask::Mul { operation_id, .. } => *operation_id,
+            GradientTask::MatMul { operation_id, .. } => *operation_id,
+            GradientTask::Transpose { operation_id, .. } => *operation_id,
+        }
+    }
+
+    /// Get the target variable ID for this task
+    pub fn get_target_variable(&self) -> VariableId {
+        match self {
+            GradientTask::Add {
+                target_variable, ..
+            } => *target_variable,
+            GradientTask::Mul {
+                target_variable, ..
+            } => *target_variable,
+            GradientTask::MatMul {
+                target_variable, ..
+            } => *target_variable,
+            GradientTask::Transpose {
+                target_variable, ..
+            } => *target_variable,
+        }
+    }
+
+    /// Get a human-readable name for the task type
+    pub fn get_task_type(&self) -> &'static str {
+        match self {
+            GradientTask::Add { .. } => "Add",
+            GradientTask::Mul { .. } => "Mul",
+            GradientTask::MatMul { .. } => "MatMul",
+            GradientTask::Transpose { .. } => "Transpose",
+        }
+    }
+
+    /// Estimate the computational complexity of this task
+    pub fn estimate_complexity(&self) -> usize {
+        match self {
+            GradientTask::Add { output_grad, .. } => output_grad.shape.dims.iter().product(),
+            GradientTask::Mul { output_grad, .. } => output_grad.shape.dims.iter().product(),
+            GradientTask::MatMul {
+                output_grad,
+                other_input,
+                ..
+            } => {
+                let m = output_grad.shape.dims.get(0).unwrap_or(&1);
+                let n = other_input.shape.dims.get(1).unwrap_or(&1);
+                let k = other_input.shape.dims.get(0).unwrap_or(&1);
+
+                m * n * k
+            }
+            GradientTask::Transpose { output_grad, .. } => output_grad.shape.dims.iter().product(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct TaskManagerStats {
+    pub active_tasks: usize,
+    pub max_concurrent_tasks: usize,
+    pub total_submitted: usize,
+    pub total_completed: usize,
+    pub total_failed: usize,
+    pub queue_length: usize,
+    pub available_permits: usize,
+    pub circuit_breaker_stats: CircuitBreakerStats,
+    pub is_shutdown: bool,
+}
+
+impl TaskManagerStats {
+    /// Check if stats indicate problems
+    pub fn indicates_problems(&self) -> bool {
+        let failure_rate = if self.total_submitted > 0 {
+            self.total_failed as f64 / self.total_submitted as f64
+        } else {
+            0.0
+        };
+
+        return self.is_shutdown
+            || self.circuit_breaker_stats.indicates_problems()
+            || failure_rate > 0.1
+            || (self.queue_length > 1000 && self.active_tasks == self.max_concurrent_tasks);
+    }
+}
+
+struct TaskGuard {
+    active_tasks: Arc<AtomicUsize>,
+}
+
+impl Drop for TaskGuard {
+    fn drop(&mut self) {
+        self.active_tasks.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 pub struct GradientTaskManager {
     task_queue: flume::Receiver<GradientTask>,
     task_sender: flume::Sender<GradientTask>,
     active_tasks: Arc<AtomicUsize>,
     max_concurrent_tasks: usize,
     completion_notifier: watch::Sender<TaskCompletion>,
-    circuit_breaker: CircuitBreaker,
+    circuit_breaker: Arc<CircuitBreaker>,
+
+    semaphore: Arc<Semaphore>,
+    shutdown_signal: Arc<AtomicBool>,
+    task_timeout: Duration,
+
+    total_tasks_submitted: AtomicUsize,
+    total_tasks_completed: AtomicUsize,
+    total_tasks_failed: AtomicUsize,
 }
 
-pub struct CircuitBreaker {
-    failure_count: AtomicUsize,
-    failure_threshold: usize,
-    recovery_timeout: Duration,
-    last_failure: AtomicU64,
-    state: AtomicU8,
+impl GradientTaskManager {
+    /// Create a new gradient task manager
+    pub fn new(
+        max_concurrent_tasks: usize,
+        circuit_breaker: CircuitBreaker,
+        task_timeout: Duration,
+    ) -> (Self, watch::Receiver<TaskCompletion>) {
+        let (task_sender, task_queue) = flume::unbounded();
+        let (completion_notifier, completion_receiver) = watch::channel(TaskCompletion::success(
+            OperationId(0),
+            VariableId(0),
+            Duration::from_millis(0),
+            None,
+        ));
+
+        return (
+            Self {
+                task_queue,
+                task_sender,
+                active_tasks: Arc::new(AtomicUsize::new(0)),
+                max_concurrent_tasks,
+                completion_notifier,
+                circuit_breaker: Arc::new(circuit_breaker),
+                semaphore: Arc::new(Semaphore::new(max_concurrent_tasks)),
+                shutdown_signal: Arc::new(AtomicBool::new(false)),
+                task_timeout,
+                total_tasks_submitted: AtomicUsize::new(0),
+                total_tasks_completed: AtomicUsize::new(0),
+                total_tasks_failed: AtomicUsize::new(0),
+            },
+            completion_receiver,
+        );
+    }
+
+    /// Create a task manager optimized for GPU gradient computation
+    pub fn for_gpu_gradients(
+        max_concurrent_tasks: usize,
+    ) -> (Self, watch::Receiver<TaskCompletion>) {
+        Self::new(
+            max_concurrent_tasks,
+            CircuitBreaker::for_gpu_operations(),
+            Duration::from_secs(10),
+        )
+    }
+
+    /// Submit a gradient task for execution
+    pub async fn submit_task(&self, task: GradientTask) -> Result<(), String> {
+        if self.shutdown_signal.load(Ordering::Acquire) == true {
+            return Err("Task manager is shutting down".to_string());
+        }
+
+        if self.circuit_breaker.is_request_allowed() == false {
+            let completion = TaskCompletion::failed(
+                task.get_operation_id(),
+                task.get_target_variable(),
+                Duration::from_millis(0),
+                "Circuit breaker is open".to_string(),
+            );
+
+            let _ = self.completion_notifier.send(completion);
+            return Err("Circuit breaker is open, rejecting task".to_string());
+        }
+
+        self.total_tasks_submitted.fetch_add(1, Ordering::Relaxed);
+        self.task_sender
+            .send_async(task)
+            .await
+            .map_err(|_| "Failed to queue task, manager may be shutting down".to_string())?;
+
+        return Ok(());
+    }
+
+    pub async fn run(&self, resource_tracker: Arc<ResourceTracker>) {
+        info!(
+            "Starting gradient task manager with {} max concurrent tasks",
+            self.max_concurrent_tasks
+        );
+
+        loop {
+            if self.shutdown_signal.load(Ordering::Acquire) {
+                info!("Shutdown signal received, stopping task manager");
+                break;
+            }
+
+            let task = match self.task_queue.recv_async().await {
+                Ok(task) => task,
+                Err(_) => {
+                    warn!("Task queue closed, stopping task manager");
+                    break;
+                }
+            };
+
+            let permit = match self.semaphore.clone().acquire_owned().await {
+                Ok(permit) => permit,
+                Err(_) => {
+                    error!("Failed to acquire semaphore permit");
+                    continue;
+                }
+            };
+
+            let resource_tracker = resource_tracker.clone();
+            let active_tasks = self.active_tasks.clone();
+            let completion_notifier = self.completion_notifier.clone();
+            let circuit_breaker = Arc::clone(&self.circuit_breaker);
+            let task_timeout = self.task_timeout;
+            let shutdown_signal = self.shutdown_signal.clone();
+
+            tokio::spawn(async move {
+                active_tasks.fetch_add(1, Ordering::Relaxed);
+
+                let _guard = TaskGuard {
+                    active_tasks: active_tasks.clone(),
+                };
+                let start_time = Instant::now();
+                let result = timeout(
+                    task_timeout,
+                    Self::execute_gradient_task(task.clone(), resource_tracker, shutdown_signal),
+                )
+                .await;
+
+                let completion = match result {
+                    Ok(Ok(gradient_norm)) => {
+                        circuit_breaker.record_success();
+                        TaskCompletion::success(
+                            task.get_operation_id(),
+                            task.get_target_variable(),
+                            start_time.elapsed(),
+                            gradient_norm,
+                        )
+                    }
+                    Ok(Err(error)) => {
+                        circuit_breaker.record_failure();
+                        TaskCompletion::failed(
+                            task.get_operation_id(),
+                            task.get_target_variable(),
+                            start_time.elapsed(),
+                            error,
+                        )
+                    }
+                    Err(_) => {
+                        circuit_breaker.record_failure();
+                        TaskCompletion::timed_out(
+                            task.get_operation_id(),
+                            task.get_target_variable(),
+                            start_time.elapsed(),
+                        )
+                    }
+                };
+
+                completion.log();
+
+                let _ = completion_notifier.send(completion);
+
+                drop(permit);
+            });
+        }
+
+        while 0 < self.active_tasks.load(Ordering::Acquire) {
+            sleep(Duration::from_millis(100)).await;
+        }
+
+        info!("Gradient task manager stopped");
+    }
+
+    /// Compute gradient norm for monitoring
+    fn compute_gradient_norm(gradient: &Tensor) -> f32 {
+        let sum_squares: f32 = gradient.data.iter().map(|x| x * x).sum();
+
+        return (sum_squares / gradient.data.len() as f32).sqrt();
+    }
+
+    /// Execute a gradient task
+    async fn execute_gradient_task(
+        task: GradientTask,
+        resource_tracker: Arc<ResourceTracker>,
+        shutdown_signal: Arc<AtomicBool>,
+    ) -> Result<Option<f32>, String> {
+        if shutdown_signal.load(Ordering::Acquire) == true {
+            return Err("Shutdown requested".to_string());
+        }
+
+        let _operation_guard = resource_tracker
+            .reserve_operation()
+            .map_err(|e| format!("Failed to reserve GPU resources: {}", e))?;
+
+        match task {
+            GradientTask::Add {
+                output_grad,
+                target_variable,
+                ..
+            } => {
+                let norm = Self::compute_gradient_norm(&output_grad);
+
+                info!(target_variable = ?target_variable, gradient_norm = norm, "Computed Add gradient");
+
+                Ok(Some(norm))
+            }
+            GradientTask::Mul {
+                output_grad,
+                other_input,
+                target_variable,
+                ..
+            } => {
+                let norm = Self::compute_gradient_norm(&output_grad);
+
+                info!(target_variable = ?target_variable, gradient_norm = norm, "Computed Mul gradient");
+
+                Ok(Some(norm))
+            }
+            GradientTask::MatMul {
+                output_grad,
+                other_input,
+                transpose_other,
+                target_variable,
+                ..
+            } => {
+                let norm = Self::compute_gradient_norm(&output_grad);
+
+                info!(
+                    target_variable = ?target_variable,
+                    gradient_norm = norm,
+                    transpose_other = transpose_other,
+                    "Computed MatMul gradient"
+                );
+
+                Ok(Some(norm))
+            }
+            GradientTask::Transpose {
+                output_grad,
+                target_variable,
+                ..
+            } => {
+                let norm = Self::compute_gradient_norm(&output_grad);
+
+                info!(target_variable = ?target_variable, gradient_norm = norm, "Computed Transpose gradient");
+
+                Ok(Some(norm))
+            }
+        }
+    }
+
+    /// Shutdown the task manager
+    pub async fn shutdown(&self) {
+        info!("Initiating task manager shutdown");
+
+        self.shutdown_signal.store(true, Ordering::Release);
+
+        let _ = &self.task_sender;
+
+        let shutdown_timeout = Duration::from_secs(30);
+        let start = Instant::now();
+
+        while self.active_tasks.load(Ordering::Acquire) > 0 {
+            if start.elapsed() > shutdown_timeout {
+                warn!("Shutdown timeout reached, some tasks may not have completed");
+                break;
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+
+        info!("Task manager shutdown complete");
+    }
+
+    /// Force emergency shutdown
+    pub fn emergency_shutdown(&self) {
+        error!("Emergency shutdown triggered");
+        self.shutdown_signal.store(true, Ordering::Release);
+        self.circuit_breaker.force_open();
+    }
+
+    /// Get current task manager statistics
+    pub fn get_stats(&self) -> TaskManagerStats {
+        TaskManagerStats {
+            active_tasks: self.active_tasks.load(Ordering::Acquire),
+            max_concurrent_tasks: self.max_concurrent_tasks,
+            total_submitted: self.total_tasks_submitted.load(Ordering::Acquire),
+            total_completed: self.total_tasks_completed.load(Ordering::Acquire),
+            total_failed: self.total_tasks_failed.load(Ordering::Acquire),
+            queue_length: self.task_queue.len(),
+            available_permits: self.semaphore.available_permits(),
+            circuit_breaker_stats: self.circuit_breaker.get_stats(),
+            is_shutdown: self.shutdown_signal.load(Ordering::Acquire),
+        }
+    }
+
+    /// Check if the task manager is healthy
+    pub fn is_healthy(&self) -> bool {
+        return (self.shutdown_signal.load(Ordering::Acquire) == false)
+            && (self.circuit_breaker.is_healthy() == true)
+            && (self.active_tasks.load(Ordering::Acquire) < self.max_concurrent_tasks);
+    }
 }
 
 pub struct BufferInfo {
@@ -913,7 +1730,7 @@ pub struct GpuContext {
 
 #[derive(Debug)]
 pub struct GradientEntry {
-    pub gradient: TensorData,
+    pub gradient: Tensor,
     pub accumulation_count: AtomicUsize,
     pub last_updated: AtomicU64, // Unix timestamp
     pub overflow_detected: AtomicBool,
