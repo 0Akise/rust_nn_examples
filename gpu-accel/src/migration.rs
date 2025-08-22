@@ -5,13 +5,13 @@ use std::sync::{atomic::AtomicUsize, Arc};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use dashmap::DashMap;
-use tokio::sync::Semaphore;
 use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{Mutex, Semaphore};
 use tokio::time::{sleep, timeout};
 use tracing::{debug, error, info, warn};
 use wgpu::{
-    Adapter, AdapterInfo, BufferUsages, CommandBuffer, CommandEncoder, CommandEncoderDescriptor,
-    Device, DeviceType, Limits, Queue,
+    Adapter, AdapterInfo, Buffer, BufferDescriptor, BufferUsages, CommandBuffer, CommandEncoder,
+    CommandEncoderDescriptor, Device, DeviceType, Limits, Queue,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -32,6 +32,14 @@ static VARIABLE_COUNTER: AtomicU64 = AtomicU64::new(0);
 static NODE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 //
+// Helper functions
+//
+
+pub fn next_buffer_id() -> BufferId {
+    BufferId(BUFFER_COUNTER.fetch_add(1, Ordering::Relaxed))
+}
+
+//
 // Primitives
 //
 
@@ -49,14 +57,6 @@ pub struct Tensor {
 //
 // GPU
 //
-
-#[derive(Debug, Clone)]
-pub enum AllocationStrategy {
-    Direct,    // Allocate immediately when needed
-    Pooled,    // Use pre-allocated buffer pool
-    Lazy,      // Allocate on first use
-    Streaming, // For large sequential operations
-}
 
 #[derive(Debug, Clone)]
 pub enum AccumulationStrategy {
@@ -1656,20 +1656,683 @@ impl GradientTaskManager {
     }
 }
 
+#[derive(Debug, Clone)]
+pub enum AllocationStrategy {
+    Direct,    // Allocate immediately when needed
+    Pooled,    // Use pre-allocated buffer pool
+    Lazy,      // Allocate on first use
+    Streaming, // For large sequential operations
+}
+
+impl AllocationStrategy {
+    /// Get the strategy best suited for a given buffer size and usage pattern
+    pub fn choose_for_usage(size_bytes: usize, usage: BufferUsages, is_temporary: bool) -> Self {
+        match (size_bytes, is_temporary) {
+            (s, _) if s < 1024 * 1024 => Self::Pooled,
+            (s, true) if 16 * 1024 * 1024 < s => Self::Direct,
+            (s, _)
+                if 64 * 1024 * 1024 < s
+                    && usage.contains(BufferUsages::MAP_READ | BufferUsages::MAP_WRITE) =>
+            {
+                Self::Streaming
+            }
+
+            _ => Self::Lazy,
+        }
+    }
+
+    /// Check if this strategy supports buffer reuse
+    pub fn supports_reuse(&self) -> bool {
+        matches!(self, Self::Pooled | Self::Lazy)
+    }
+
+    /// Get the cleanup priority (higher = clean up sooner)
+    pub fn cleanup_priority(&self) -> u8 {
+        match self {
+            Self::Direct => 255,
+            Self::Streaming => 200,
+            Self::Lazy => 100,
+            Self::Pooled => 50,
+        }
+    }
+}
+
 pub struct BufferInfo {
+    buffer: Arc<Buffer>,
     size: usize,
     usage: BufferUsages,
+    strategy: AllocationStrategy,
     created_at: Instant,
-    last_used: AtomicU64,
+    last_used: AtomicU64, // Unix timestamp in seconds
     ref_count: AtomicUsize,
+    is_pooled: bool,
+}
+
+impl BufferInfo {
+    pub fn new(
+        buffer: Buffer,
+        size: usize,
+        usage: BufferUsages,
+        strategy: AllocationStrategy,
+        is_pooled: bool,
+    ) -> Self {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        return Self {
+            buffer: Arc::new(buffer),
+            size,
+            usage,
+            strategy,
+            created_at: Instant::now(),
+            last_used: AtomicU64::new(now),
+            ref_count: AtomicUsize::new(1),
+            is_pooled,
+        };
+    }
+
+    pub fn touch(&self) {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        self.last_used.store(now, Ordering::Relaxed);
+    }
+
+    pub fn age(&self) -> Duration {
+        return self.created_at.elapsed();
+    }
+
+    pub fn seconds_since_last_use(&self) -> u64 {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let last_used = self.last_used.load(Ordering::Relaxed);
+
+        return now.saturating_sub(last_used);
+    }
+
+    pub fn increment_ref(&self) -> usize {
+        return self.ref_count.fetch_add(1, Ordering::Relaxed) + 1;
+    }
+
+    pub fn decrement_ref(&self) -> usize {
+        let prev = self.ref_count.fetch_sub(1, Ordering::Relaxed);
+
+        return prev.saturating_sub(1);
+    }
+
+    pub fn get_ref_count(&self) -> usize {
+        return self.ref_count.load(Ordering::Relaxed);
+    }
+
+    /// Check if this buffer is a candidate for cleanup
+    pub fn is_cleanup_candidate(&self, max_age_seconds: u64, min_idle_seconds: u64) -> bool {
+        if 1 < self.get_ref_count() {
+            return false;
+        }
+
+        let age_seconds = self.age().as_secs();
+        let idle_seconds = self.seconds_since_last_use();
+
+        if self.is_pooled && age_seconds < max_age_seconds / 2 {
+            return false;
+        }
+
+        return age_seconds > max_age_seconds || idle_seconds > min_idle_seconds;
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct MemoryStats {
+    total_allocated_bytes: usize,
+    peak_usage_bytes: usize,
+    active_buffers: usize,
+    pooled_buffers: usize,
+    cleanup_queue_length: usize,
+    allocation_strategy_counts: [usize; 4], // [Direct, Pooled, Lazy, Streaming]
+}
+
+impl MemoryStats {
+    pub fn allocation_efficiency(&self) -> f64 {
+        if self.active_buffers == 0 {
+            return 1.0;
+        }
+
+        let pooled_ratio = self.pooled_buffers as f64 / self.active_buffers as f64;
+
+        return (pooled_ratio * 0.8) + 0.2;
+    }
+
+    pub fn memory_pressure(&self) -> f64 {
+        if self.peak_usage_bytes == 0 {
+            return 0.0;
+        }
+
+        return (self.total_allocated_bytes as f64) / (self.peak_usage_bytes as f64);
+    }
+}
+
+pub struct BufferPool {
+    available_buffers: VecDeque<BufferId>,
+    size_class: usize, // Buffers in this pool are approximately this size
+    usage: BufferUsages,
+    max_pool_size: usize,
+    hit_count: AtomicUsize,
+    miss_count: AtomicUsize,
+}
+
+impl BufferPool {
+    pub fn new(size_class: usize, usage: BufferUsages, max_pool_size: usize) -> Self {
+        Self {
+            available_buffers: VecDeque::with_capacity(max_pool_size),
+            size_class,
+            usage,
+            max_pool_size,
+            hit_count: AtomicUsize::new(0),
+            miss_count: AtomicUsize::new(0),
+        }
+    }
+
+    pub fn try_get_buffer(&mut self, requested_size: usize) -> Option<BufferId> {
+        let size_tolerance = self.size_class / 4;
+
+        if (requested_size < self.size_class.saturating_sub(size_tolerance))
+            || (self.size_class + size_tolerance < requested_size)
+        {
+            return None;
+        }
+
+        if let Some(buffer_id) = self.available_buffers.pop_front() {
+            self.hit_count.fetch_add(1, Ordering::Relaxed);
+
+            Some(buffer_id)
+        } else {
+            self.miss_count.fetch_add(1, Ordering::Relaxed);
+
+            return None;
+        }
+    }
+
+    pub fn return_buffer(&mut self, buffer_id: BufferId) -> bool {
+        if self.max_pool_size <= self.available_buffers.len() {
+            return false;
+        }
+
+        self.available_buffers.push_back(buffer_id);
+
+        return true;
+    }
+
+    pub fn hit_rate(&self) -> f64 {
+        let hits = self.hit_count.load(Ordering::Relaxed);
+        let misses = self.miss_count.load(Ordering::Relaxed);
+        let total = hits + misses;
+
+        if total == 0 {
+            return 0.0;
+        } else {
+            return (hits as f64) / (total as f64);
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        return self.available_buffers.len();
+    }
+
+    pub fn clear(&mut self) -> usize {
+        let count = self.available_buffers.len();
+
+        self.available_buffers.clear();
+
+        return count;
+    }
 }
 
 pub struct GpuMemoryManager {
+    device: Arc<Device>,
+    queue: Arc<Queue>,
+    resource_tracker: Arc<ResourceTracker>,
+
     allocated_buffers: DashMap<BufferId, BufferInfo>,
     memory_usage: AtomicUsize,
     peak_usage: AtomicUsize,
+
+    buffer_pools: Mutex<Vec<BufferPool>>,
+
+    cleanup_scheduler: mpsc::UnboundedSender<BufferId>,
+    cleanup_receiver: Mutex<mpsc::UnboundedReceiver<BufferId>>,
+
     allocation_strategy: AllocationStrategy,
-    cleanup_scheduler: mpsc::Sender<BufferId>,
+    max_memory_bytes: usize,
+    cleanup_interval: Duration,
+
+    total_allocations: AtomicUsize,
+    total_deallocations: AtomicUsize,
+    cleanup_runs: AtomicUsize,
+    emergency_cleanups: AtomicUsize,
+}
+
+impl GpuMemoryManager {
+    pub fn new(
+        device: Arc<Device>,
+        queue: Arc<Queue>,
+        resource_tracker: Arc<ResourceTracker>,
+        allocation_strategy: AllocationStrategy,
+        max_memory_mb: usize,
+    ) -> Self {
+        let (cleanup_sender, cleanup_receiver) = mpsc::unbounded_channel();
+        let mut pools = Vec::new();
+
+        for &size_class in &[
+            1024,             // 1KB - small uniforms
+            4 * 1024,         // 4KB - small buffers
+            64 * 1024,        // 64KB - medium buffers
+            1024 * 1024,      // 1MB - large buffers
+            16 * 1024 * 1024, // 16MB - very large buffers
+        ] {
+            pools.push(BufferPool::new(
+                size_class,
+                BufferUsages::STORAGE | BufferUsages::COPY_DST | BufferUsages::COPY_SRC,
+                8,
+            ));
+        }
+
+        Self {
+            device,
+            queue,
+            resource_tracker,
+            allocated_buffers: DashMap::new(),
+            memory_usage: AtomicUsize::new(0),
+            peak_usage: AtomicUsize::new(0),
+            buffer_pools: Mutex::new(pools),
+            cleanup_scheduler: cleanup_sender,
+            cleanup_receiver: Mutex::new(cleanup_receiver),
+            allocation_strategy,
+            max_memory_bytes: max_memory_mb * 1024 * 1024,
+            cleanup_interval: Duration::from_secs(30),
+            total_allocations: AtomicUsize::new(0),
+            total_deallocations: AtomicUsize::new(0),
+            cleanup_runs: AtomicUsize::new(0),
+            emergency_cleanups: AtomicUsize::new(0),
+        }
+    }
+
+    /// Allocate a new GPU buffer with the specified parameters
+    pub async fn allocate_buffer(
+        &self,
+        size_bytes: usize,
+        usage: BufferUsages,
+        label: Option<&str>,
+        strategy_override: Option<AllocationStrategy>,
+    ) -> Result<BufferId, GpuError> {
+        let current_usage = self.memory_usage.load(Ordering::Acquire);
+
+        if self.max_memory_bytes < current_usage + size_bytes {
+            self.try_emergency_cleanup().await;
+
+            let current_usage = self.memory_usage.load(Ordering::Acquire);
+
+            if self.max_memory_bytes < current_usage + size_bytes {
+                return Err(GpuError::MemoryExhaustion {
+                    requested: size_bytes / (1024 * 1024),
+                    available: (self.max_memory_bytes - current_usage) / (1024 * 1024),
+                });
+            }
+        }
+
+        let strategy = strategy_override
+            .unwrap_or_else(|| AllocationStrategy::choose_for_usage(size_bytes, usage, false));
+
+        if matches!(strategy, AllocationStrategy::Pooled) {
+            if let Some(buffer_id) = self.try_get_from_pool(size_bytes, usage).await {
+                return Ok(buffer_id);
+            }
+        }
+
+        let buffer = self.device.create_buffer(&BufferDescriptor {
+            label,
+            size: size_bytes as u64,
+            usage,
+            mapped_at_creation: false,
+        });
+
+        let buffer_id = next_buffer_id();
+        let is_pooled = matches!(strategy, AllocationStrategy::Pooled);
+
+        let buffer_info = BufferInfo::new(buffer, size_bytes, usage, strategy, is_pooled);
+
+        // Update memory tracking
+        self.memory_usage.fetch_add(size_bytes, Ordering::Relaxed);
+        let new_usage = self.memory_usage.load(Ordering::Relaxed);
+
+        // Update peak usage
+        loop {
+            let current_peak = self.peak_usage.load(Ordering::Relaxed);
+            if new_usage <= current_peak {
+                break;
+            }
+
+            if self
+                .peak_usage
+                .compare_exchange_weak(
+                    current_peak,
+                    new_usage,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                )
+                .is_ok()
+            {
+                break;
+            }
+        }
+
+        self.allocated_buffers.insert(buffer_id, buffer_info);
+        self.total_allocations.fetch_add(1, Ordering::Relaxed);
+
+        Ok(buffer_id)
+    }
+
+    /// Get a reference to a buffer, incrementing its reference count
+    pub fn get_buffer(&self, buffer_id: BufferId) -> Option<Arc<Buffer>> {
+        self.allocated_buffers.get(&buffer_id).map(|entry| {
+            let buffer_info = entry.value();
+            buffer_info.touch();
+            buffer_info.increment_ref();
+            buffer_info.buffer.clone()
+        })
+    }
+
+    /// Release a buffer reference, potentially scheduling it for cleanup
+    pub async fn release_buffer(&self, buffer_id: BufferId) -> Result<(), GpuError> {
+        if let Some(entry) = self.allocated_buffers.get(&buffer_id) {
+            let buffer_info = entry.value();
+            let new_ref_count = buffer_info.decrement_ref();
+
+            if new_ref_count == 0 {
+                if let Err(_) = self.cleanup_scheduler.send(buffer_id) {
+                    warn!(buffer_id = ?buffer_id, "Failed to schedule buffer cleanup");
+                }
+            }
+
+            debug!(
+                buffer_id = ?buffer_id,
+                ref_count = new_ref_count,
+                "Released buffer reference"
+            );
+        }
+
+        Ok(())
+    }
+
+    async fn try_get_from_pool(&self, size_bytes: usize, usage: BufferUsages) -> Option<BufferId> {
+        let mut pools = self.buffer_pools.lock().await;
+
+        for pool in pools.iter_mut() {
+            if pool.usage.contains(usage) {
+                if let Some(buffer_id) = pool.try_get_buffer(size_bytes) {
+                    if let Some(entry) = self.allocated_buffers.get(&buffer_id) {
+                        let buffer_info = entry.value();
+
+                        buffer_info.touch();
+                        buffer_info.increment_ref();
+
+                        debug!(
+                            buffer_id = ?buffer_id,
+                            size_bytes = size_bytes,
+                            pool_hit_rate = pool.hit_rate(),
+                            "Retrieved buffer from pool"
+                        );
+
+                        return Some(buffer_id);
+                    } else {
+                        warn!(buffer_id = ?buffer_id, "Buffer in pool but not in allocated_buffers");
+                    }
+                }
+            }
+        }
+
+        return None;
+    }
+
+    /// Try to return a buffer to the pool
+    async fn try_return_to_pool(&self, buffer_id: BufferId) -> bool {
+        if let Some(entry) = self.allocated_buffers.get(&buffer_id) {
+            let buffer_info = entry.value();
+
+            if !buffer_info.is_pooled {
+                return false;
+            }
+
+            let mut pools = self.buffer_pools.lock().await;
+
+            for pool in pools.iter_mut() {
+                if pool.usage.contains(buffer_info.usage) {
+                    if pool.return_buffer(buffer_id) {
+                        debug!(
+                            buffer_id = ?buffer_id,
+                            size_bytes = buffer_info.size,
+                            "Returned buffer to pool"
+                        );
+                        return true;
+                    }
+                }
+            }
+        }
+
+        return false;
+    }
+
+    /// Clean up a specific buffer
+    async fn cleanup_buffer(&self, buffer_id: BufferId) {
+        if self.try_return_to_pool(buffer_id).await == true {
+            debug!(buffer_id = ?buffer_id, "Buffer returned to pool for reuse");
+        } else {
+            if let Some((_, buffer_info)) = self.allocated_buffers.remove(&buffer_id) {
+                self.memory_usage
+                    .fetch_sub(buffer_info.size, Ordering::Relaxed);
+                self.total_deallocations.fetch_add(1, Ordering::Relaxed);
+
+                debug!(
+                    buffer_id = ?buffer_id,
+                    size_bytes = buffer_info.size,
+                    age_seconds = buffer_info.age().as_secs(),
+                    "Deallocated GPU buffer"
+                );
+            }
+        }
+    }
+
+    /// Run the cleanup background task
+    pub async fn run_cleanup_task(&self) {
+        info!("Starting GPU memory cleanup task");
+
+        let mut cleanup_receiver = self.cleanup_receiver.lock().await;
+        let mut cleanup_timer = tokio::time::interval(self.cleanup_interval);
+
+        loop {
+            tokio::select! {
+                buffer_id = cleanup_receiver.recv() => {
+                    if let Some(buffer_id) = buffer_id {
+                        self.cleanup_buffer(buffer_id).await;
+                    } else {
+                        info!("Cleanup channel closed, stopping cleanup task");
+                        break;
+                    }
+                }
+
+                _ = cleanup_timer.tick() => {
+                    self.periodic_cleanup().await;
+                }
+            }
+        }
+    }
+
+    /// Periodic cleanup of old/unused buffers
+    async fn periodic_cleanup(&self) {
+        let start = Instant::now();
+        let mut cleaned = 0;
+        let cleanup_candidates: Vec<BufferId> = self
+            .allocated_buffers
+            .iter()
+            .filter_map(|entry| {
+                let buffer_id = *entry.key();
+                let buffer_info = entry.value();
+                let should_cleanup = match buffer_info.strategy {
+                    AllocationStrategy::Direct => {
+                        buffer_info.is_cleanup_candidate(300, 60) // 5 min max age, 1 min idle
+                    }
+                    AllocationStrategy::Pooled => {
+                        buffer_info.is_cleanup_candidate(1800, 300) // 30 min max age, 5 min idle
+                    }
+                    AllocationStrategy::Lazy => {
+                        buffer_info.is_cleanup_candidate(900, 180) // 15 min max age, 3 min idle
+                    }
+                    AllocationStrategy::Streaming => {
+                        buffer_info.is_cleanup_candidate(60, 30) // 1 min max age, 30 sec idle
+                    }
+                };
+
+                if should_cleanup {
+                    Some(buffer_id)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        for buffer_id in cleanup_candidates {
+            self.cleanup_buffer(buffer_id).await;
+
+            cleaned += 1;
+        }
+
+        if cleaned > 0 {
+            let duration = start.elapsed();
+
+            info!(
+                cleaned_buffers = cleaned,
+                cleanup_duration_ms = duration.as_millis(),
+                current_memory_mb = self.memory_usage.load(Ordering::Relaxed) / (1024 * 1024),
+                "Completed periodic cleanup"
+            );
+        }
+
+        self.cleanup_runs.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Emergency cleanup when memory is running low
+    async fn try_emergency_cleanup(&self) {
+        warn!("Running emergency memory cleanup");
+
+        let start = Instant::now();
+        let mut cleaned = 0;
+        let emergency_candidates: Vec<BufferId> = self
+            .allocated_buffers
+            .iter()
+            .filter_map(|entry| {
+                let buffer_id = *entry.key();
+                let buffer_info = entry.value();
+
+                if buffer_info.get_ref_count() <= 1 {
+                    Some(buffer_id)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        for buffer_id in emergency_candidates {
+            self.cleanup_buffer(buffer_id).await;
+            cleaned += 1;
+        }
+
+        let duration = start.elapsed();
+        error!(
+            cleaned_buffers = cleaned,
+            cleanup_duration_ms = duration.as_millis(),
+            current_memory_mb = self.memory_usage.load(Ordering::Relaxed) / (1024 * 1024),
+            "Completed emergency cleanup"
+        );
+
+        self.emergency_cleanups.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Get current memory statistics
+    pub fn get_stats(&self) -> MemoryStats {
+        let mut strategy_counts = [0; 4];
+        let mut pooled_count = 0;
+
+        for entry in self.allocated_buffers.iter() {
+            let buffer_info = entry.value();
+            let strategy_index = match buffer_info.strategy {
+                AllocationStrategy::Direct => 0,
+                AllocationStrategy::Pooled => 1,
+                AllocationStrategy::Lazy => 2,
+                AllocationStrategy::Streaming => 3,
+            };
+
+            strategy_counts[strategy_index] += 1;
+
+            if buffer_info.is_pooled {
+                pooled_count += 1;
+            }
+        }
+
+        MemoryStats {
+            total_allocated_bytes: self.memory_usage.load(Ordering::Relaxed),
+            peak_usage_bytes: self.peak_usage.load(Ordering::Relaxed),
+            active_buffers: self.allocated_buffers.len(),
+            pooled_buffers: pooled_count,
+            cleanup_queue_length: 0,
+            allocation_strategy_counts: strategy_counts,
+        }
+    }
+
+    /// Force cleanup of all buffers (for shutdown)
+    pub async fn shutdown(&self) {
+        info!("Shutting down GPU memory manager");
+
+        let mut pools = self.buffer_pools.lock().await;
+        let mut total_cleared = 0;
+
+        for pool in pools.iter_mut() {
+            while let Some(buffer_id) = pool.available_buffers.pop_front() {
+                self.allocated_buffers.remove(&buffer_id);
+                total_cleared += 1;
+            }
+        }
+
+        drop(pools);
+
+        let buffer_ids: Vec<BufferId> = self
+            .allocated_buffers
+            .iter()
+            .map(|entry| *entry.key())
+            .collect();
+
+        for buffer_id in buffer_ids {
+            if let Some((_, _)) = self.allocated_buffers.remove(&buffer_id) {}
+        }
+
+        info!(
+            cleared_pool_buffers = total_cleared,
+            final_memory_usage = self.memory_usage.load(Ordering::Relaxed),
+            "GPU memory manager shutdown complete"
+        );
+    }
+
+    pub fn is_healthy(&self) -> bool {
+        let stats = self.get_stats();
+        let memory_pressure = stats.memory_pressure();
+        let allocation_efficiency = stats.allocation_efficiency();
+
+        return (memory_pressure < 0.9) && (0.3 < allocation_efficiency);
+    }
 }
 
 #[derive(Debug, Clone)]
