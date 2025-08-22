@@ -6,11 +6,12 @@ edition = "2021"
 [dependencies]
 gpu-accel = { path = "../gpu-accel" }
 nn-backbone = { path = "../nn-backbone" }
-pollster = { workspace = true }
-wgpu = { workspace = true }
-tokio = { version = "1.0", features = ["full"] }
-flume = { workspace = true }
-bytemuck = { workspace = true }
+
+wgpu = "*"
+pollster = "*"
+tokio = { version = "*", features = ["full"] }
+flume = "*"
+bytemuck = "*"
 
 [[bin]]
 name = "t_gpu"

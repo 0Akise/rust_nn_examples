@@ -1,6 +1,6 @@
 pub mod gpu_module;
-pub mod mig;
-pub mod mig_shader;
+pub mod migration;
+pub mod migration_shader;
 pub mod shader_manager;
 
 use gpu_module::GpuModule;

@@ -6,7 +6,8 @@ description = "simple Neural Network Backbone for examples"
 
 [dependencies]
 gpu-accel = { path = "../gpu-accel" }
-pollster = { workspace = true }
+
+pollster = "*"
 rand = "*"
 tokio = { version = "1.0", features = ["full"] }
 lazy_static = "1.4"

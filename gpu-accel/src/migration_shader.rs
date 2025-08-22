@@ -1,4 +1,4 @@
-use super::mig::Shape;
+use super::migration::Shape;
 
 use std::collections::HashMap;
 use std::error::Error;

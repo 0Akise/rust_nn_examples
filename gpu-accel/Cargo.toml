@@ -37,3 +37,6 @@ tracing-futures = "*"
 metrics = "*"
 metrics-exporter-prometheus = "*"
 sysinfo = "*"
+
+[dev-dependencies]
+tokio-test = "*"
