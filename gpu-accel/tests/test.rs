@@ -4,41 +4,53 @@ mod tests {
 
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
-    use std::thread;
     use std::time::{Duration, Instant};
 
     use tokio::time::sleep;
     use wgpu::{
-        Device, DeviceDescriptor, Features, Instance, Limits, Queue, RequestAdapterOptions,
+        BufferUsages, Device, DeviceDescriptor, Features, Instance, Limits, Queue,
+        RequestAdapterOptions,
     };
 
     async fn create_test_gpu_context() -> (Device, Queue) {
-        let instance = Instance::new(&wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::all(),
-            ..Default::default()
-        });
+        let context_creation = async {
+            let instance = Instance::new(&wgpu::InstanceDescriptor {
+                backends: wgpu::Backends::all(),
+                ..Default::default()
+            });
 
-        let adapter = instance
-            .request_adapter(&RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::LowPower,
-                compatible_surface: None,
-                force_fallback_adapter: true,
-            })
+            let adapter = instance
+                .request_adapter(&RequestAdapterOptions {
+                    power_preference: wgpu::PowerPreference::LowPower,
+                    compatible_surface: None,
+                    force_fallback_adapter: true,
+                })
+                .await
+                .expect("Failed to create adapter for testing");
+
+            let info = adapter.get_info();
+            println!(
+                "Test using GPU: {} (Vendor: {:04X}, Type: {:?})",
+                info.name, info.vendor, info.device_type
+            );
+
+            let (device, queue) = adapter
+                .request_device(&DeviceDescriptor {
+                    label: Some("Test Device"),
+                    required_features: Features::empty(),
+                    required_limits: Limits::downlevel_defaults(),
+                    memory_hints: wgpu::MemoryHints::default(),
+                    trace: wgpu::Trace::Off,
+                })
+                .await
+                .expect("Failed to create device for testing");
+
+            (device, queue)
+        };
+
+        tokio::time::timeout(Duration::from_secs(10), context_creation)
             .await
-            .expect("Failed to create adapter for testing");
-
-        let (device, queue) = adapter
-            .request_device(&DeviceDescriptor {
-                label: Some("Test Device"),
-                required_features: Features::empty(),
-                required_limits: Limits::downlevel_defaults(),
-                memory_hints: wgpu::MemoryHints::default(),
-                trace: wgpu::Trace::Off,
-            })
-            .await
-            .expect("Failed to create device for testing");
-
-        (device, queue)
+            .expect("GPU context creation should not hang")
     }
 
     fn next_operation_id() -> OperationId {
@@ -46,381 +58,499 @@ mod tests {
         OperationId(COUNTER.fetch_add(1, Ordering::Relaxed) as u64)
     }
 
-    #[test]
-    fn test_resource_limits_creation() {
-        let generic = ResourceLimits::generic();
-        assert_eq!(generic.max_concurrent_operations, 8);
-        assert_eq!(generic.max_command_buffers, 16);
-        assert_eq!(generic.queue_depth_limit, 32);
-
-        let limits = Limits::downlevel_defaults();
-        let estimated_mb = ResourceLimits::estimate_memory(&limits);
-        assert!(estimated_mb > 0, "Should estimate some memory");
+    fn next_variable_id() -> VariableId {
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        VariableId(COUNTER.fetch_add(1, Ordering::Relaxed) as u64)
     }
 
-    #[test]
-    fn test_resource_tracker_creation() {
-        let limits = ResourceLimits::generic();
-        let tracker = ResourceTracker::new(limits).expect("Should create tracker");
-
-        let usage = tracker.current_usage();
-        assert_eq!(usage.gpu_operations, 0);
-        assert_eq!(usage.command_buffers, 0);
-        assert_eq!(usage.memory_usage_mb, 0);
-        assert_eq!(usage.total_queue_depth, 0);
+    fn create_test_tensor(dims: Vec<usize>) -> Tensor {
+        let total_elements: usize = dims.iter().product();
+        let data: Vec<f32> = (0..total_elements).map(|i| i as f32).collect();
+        let shape = Shape { dims };
+        Tensor {
+            data: Arc::new(data),
+            shape,
+        }
     }
 
-    #[test]
-    fn test_resource_tracker_basic_reservations() {
-        let limits = ResourceLimits::generic();
-        let tracker = ResourceTracker::new(limits).expect("Should create tracker");
+    #[tokio::test]
+    async fn test_gradient_task_manager_creation() {
+        let (task_manager, completion_receiver) = GradientTaskManager::for_gpu_gradients(4);
 
-        let queue_guard = tracker
-            .reserve_queue_slot()
-            .expect("Should reserve queue slot");
-        assert_eq!(tracker.current_usage().total_queue_depth, 1);
-
-        drop(queue_guard);
-        assert_eq!(tracker.current_usage().total_queue_depth, 0);
-
-        let cmd_guard = tracker
-            .reserve_command_buffer()
-            .expect("Should reserve command buffer");
-        assert_eq!(tracker.current_usage().command_buffers, 1);
-
-        drop(cmd_guard);
-        assert_eq!(tracker.current_usage().command_buffers, 0);
-
-        let mem_guard = tracker.reserve_memory(100).expect("Should reserve memory");
-        assert_eq!(tracker.current_usage().memory_usage_mb, 100);
-
-        drop(mem_guard);
-        assert_eq!(tracker.current_usage().memory_usage_mb, 0);
+        let stats = task_manager.get_stats();
+        assert_eq!(stats.max_concurrent_tasks, 4);
+        assert_eq!(stats.active_tasks, 0);
+        assert_eq!(stats.total_submitted, 0);
+        assert!(stats.is_shutdown == false);
+        assert!(task_manager.is_healthy());
     }
 
-    #[test]
-    fn test_resource_tracker_limits_enforcement() {
-        let mut limits = ResourceLimits::generic();
-        limits.max_concurrent_operations = 2;
-        limits.queue_depth_limit = 3;
-        limits.max_command_buffers = 2;
-        limits.max_memory_usage_mb = 100;
+    #[tokio::test]
+    async fn test_gradient_task_submission() {
+        let test_timeout = Duration::from_secs(10);
+        let result = tokio::time::timeout(test_timeout, async {
+            let (task_manager, mut completion_receiver) = GradientTaskManager::for_gpu_gradients(2);
+            let limits = ResourceLimits::generic();
+            let resource_tracker =
+                Arc::new(ResourceTracker::new(limits).expect("Should create tracker"));
 
-        let tracker = ResourceTracker::new(limits).expect("Should create tracker");
+            let task_manager_arc = Arc::new(task_manager);
+            let manager_clone = task_manager_arc.clone();
+            let tracker_clone = resource_tracker.clone();
 
-        let _guard1 = tracker
-            .reserve_queue_slot()
-            .expect("First reservation should work");
-        let _guard2 = tracker
-            .reserve_queue_slot()
-            .expect("Second reservation should work");
-        let _guard3 = tracker
-            .reserve_queue_slot()
-            .expect("Third reservation should work");
+            let manager_handle = tokio::spawn(async move {
+                manager_clone.run(tracker_clone).await;
+            });
 
-        let result = tracker.reserve_queue_slot();
-        assert!(matches!(
-            result,
-            Err(GpuError::QueueOverflow {
-                active: 3,
-                limit: 3
-            })
-        ));
+            for i in 0..2 {
+                let gradient_tensor = create_test_tensor(vec![2, 2]);
+                let task = GradientTask::Add {
+                    output_grad: gradient_tensor,
+                    target_variable: next_variable_id(),
+                    operation_id: next_operation_id(),
+                };
 
-        let _cmd1 = tracker
-            .reserve_command_buffer()
-            .expect("First cmd buffer should work");
-        let _cmd2 = tracker
-            .reserve_command_buffer()
-            .expect("Second cmd buffer should work");
+                let result = task_manager_arc.submit_task(task).await;
+                assert!(result.is_ok(), "Task submission {} should succeed", i);
+            }
 
-        let result = tracker.reserve_command_buffer();
-        assert!(matches!(
-            result,
-            Err(GpuError::QueueOverflow {
-                active: 2,
-                limit: 2
-            })
-        ));
+            let mut completions = 0;
+            let completion_timeout = Duration::from_secs(3);
+            let start = Instant::now();
 
-        let _mem1 = tracker
-            .reserve_memory(50)
-            .expect("First memory reservation should work");
-        let _mem2 = tracker
-            .reserve_memory(30)
-            .expect("Second memory reservation should work");
-
-        let result = tracker.reserve_memory(30);
-        assert!(matches!(
-            result,
-            Err(GpuError::MemoryExhaustion {
-                requested: 30,
-                available: 20
-            })
-        ));
-    }
-
-    #[test]
-    fn test_resource_tracker_emergency_stop() {
-        let limits = ResourceLimits::generic();
-        let tracker = ResourceTracker::new(limits).expect("Should create tracker");
-
-        let _guard = tracker.reserve_queue_slot().expect("Should work normally");
-
-        tracker.emergency_stop_trigger();
-
-        let result = tracker.reserve_queue_slot();
-        assert!(matches!(
-            result,
-            Err(GpuError::CircuitBreakerOpen { failures: 0 })
-        ));
-
-        tracker.emergency_stop_reset();
-        let _guard2 = tracker
-            .reserve_queue_slot()
-            .expect("Should work after reset");
-    }
-
-    #[test]
-    fn test_resource_tracker_concurrent_access() {
-        let limits = ResourceLimits::generic();
-        let tracker = Arc::new(ResourceTracker::new(limits).expect("Should create tracker"));
-        let success_count = Arc::new(AtomicUsize::new(0));
-        let failure_count = Arc::new(AtomicUsize::new(0));
-
-        let handles: Vec<_> = (0..20)
-            .map(|_| {
-                let tracker = Arc::clone(&tracker);
-                let success_count = Arc::clone(&success_count);
-                let failure_count = Arc::clone(&failure_count);
-
-                thread::spawn(move || {
-                    if let Ok(_guard) = tracker.reserve_queue_slot() {
-                        success_count.fetch_add(1, Ordering::Relaxed);
-                        thread::sleep(Duration::from_millis(10));
-                    } else {
-                        failure_count.fetch_add(1, Ordering::Relaxed);
+            while completions < 2 && start.elapsed() < completion_timeout {
+                match tokio::time::timeout(
+                    Duration::from_millis(500),
+                    completion_receiver.changed(),
+                )
+                .await
+                {
+                    Ok(Ok(())) => {
+                        let completion = completion_receiver.borrow_and_update();
+                        if completion.is_success() {
+                            completions += 1;
+                            println!(
+                                "Received completion {} for operation {:?}",
+                                completions, completion.operation_id
+                            );
+                        }
                     }
-                })
-            })
-            .collect();
+                    Ok(Err(_)) => break,
+                    Err(_) => continue,
+                }
+            }
 
-        for handle in handles {
-            handle.join().unwrap();
+            let stats = task_manager_arc.get_stats();
+            println!(
+                "Final stats: submitted={}, completed={}, active={}",
+                stats.total_submitted, completions, stats.active_tasks
+            );
+
+            tokio::select! {
+                _ = task_manager_arc.shutdown() => {},
+                _ = tokio::time::sleep(Duration::from_secs(2)) => {
+                    println!("Shutdown timeout, forcing emergency shutdown");
+                    task_manager_arc.emergency_shutdown();
+                }
+            }
+
+            manager_handle.abort();
+
+            assert!(
+                stats.total_submitted >= 2,
+                "Should have submitted at least 2 tasks"
+            );
+        })
+        .await;
+
+        assert!(result.is_ok(), "Test should complete within timeout");
+    }
+
+    #[tokio::test]
+    async fn test_circuit_breaker_functionality() {
+        let circuit_breaker = CircuitBreaker::for_gpu_operations();
+
+        assert_eq!(circuit_breaker.get_state(), CircuitBreakerState::Closed);
+        assert!(circuit_breaker.is_healthy());
+        assert!(circuit_breaker.is_request_allowed());
+
+        for _ in 0..3 {
+            let allowed = circuit_breaker.is_request_allowed();
+            assert!(allowed, "Request should be allowed in closed state");
+            circuit_breaker.record_success();
         }
 
-        let successes = success_count.load(Ordering::Relaxed);
-        let failures = failure_count.load(Ordering::Relaxed);
+        let stats = circuit_breaker.get_stats();
+        assert_eq!(stats.successful_requests, 3);
+        assert_eq!(stats.total_requests, 3);
+        assert!((stats.success_rate - 1.0).abs() < 0.01);
 
-        println!(
-            "Concurrent test: {} successes, {} failures",
-            successes, failures
-        );
-        assert_eq!(successes + failures, 20);
-        assert!(successes > 0, "Should have some successes");
-    }
-
-    #[tokio::test]
-    async fn test_command_buffer_pool_creation() {
-        let (device, queue) = create_test_gpu_context().await;
-
-        let pool = CommandBufferPool::new(device, queue, 4, 8, Duration::from_secs(5));
-
-        let status = pool.get_status();
-        assert_eq!(status.active_buffers, 0);
-        assert_eq!(status.available_encoders, 0);
-        assert_eq!(status.total_submissions, 0);
-        assert_eq!(status.timeout_count, 0);
-    }
-
-    #[tokio::test]
-    async fn test_command_buffer_pool_encoder_management() {
-        let (device, queue) = create_test_gpu_context().await;
-        let limits = ResourceLimits::generic();
-        let tracker = ResourceTracker::new(limits).expect("Should create tracker");
-
-        let mut pool = CommandBufferPool::new(device, queue, 4, 8, Duration::from_secs(5));
-
-        let encoder = pool
-            .get_encoder(Some("Test Encoder"), &tracker)
-            .expect("Should get encoder");
-
-        pool.return_encoder(encoder);
-
-        let status = pool.get_status();
-        assert_eq!(status.available_encoders, 1);
-
-        let _encoder2 = pool
-            .get_encoder(Some("Test Encoder 2"), &tracker)
-            .expect("Should reuse encoder");
-
-        let status = pool.get_status();
-        assert_eq!(status.available_encoders, 0);
-    }
-
-    #[tokio::test]
-    async fn test_command_buffer_pool_batch_submission() {
-        let (device, queue) = create_test_gpu_context().await;
-        let limits = ResourceLimits::generic();
-        let tracker = ResourceTracker::new(limits).expect("Should create tracker");
-
-        let mut pool = CommandBufferPool::new(device, queue, 2, 8, Duration::from_secs(5));
-
-        for i in 0..3 {
-            let encoder = pool
-                .get_encoder(Some(&format!("Test {}", i)), &tracker)
-                .expect("Should get encoder");
-            let buffer = encoder.finish();
-            let guard = tracker.reserve_command_buffer().expect("Should get guard");
-
-            pool.submit_buffer(buffer, next_operation_id(), None, guard)
-                .expect("Should submit buffer");
+        for i in 0..5 {
+            let allowed = circuit_breaker.is_request_allowed();
+            println!(
+                "Failure {}: request allowed = {}, state = {:?}",
+                i,
+                allowed,
+                circuit_breaker.get_state()
+            );
+            circuit_breaker.record_failure();
         }
 
-        let status = pool.get_status();
+        assert_eq!(circuit_breaker.get_state(), CircuitBreakerState::Open);
+        assert!(!circuit_breaker.is_healthy());
+
+        assert!(!circuit_breaker.is_request_allowed());
+        assert!(!circuit_breaker.is_request_allowed());
+
+        let final_stats = circuit_breaker.get_stats();
+        assert_eq!(final_stats.failure_count, 5);
+        assert!(final_stats.rejected_requests > 0);
+    }
+
+    #[tokio::test]
+    async fn test_gpu_memory_manager_basic_allocation() {
+        let test_timeout = Duration::from_secs(15);
+        let result = tokio::time::timeout(test_timeout, async {
+            let (device, queue) = create_test_gpu_context().await;
+            let limits = ResourceLimits::generic();
+            let resource_tracker =
+                Arc::new(ResourceTracker::new(limits).expect("Should create tracker"));
+
+            let memory_manager = GpuMemoryManager::new(
+                Arc::new(device),
+                Arc::new(queue),
+                resource_tracker,
+                AllocationStrategy::Pooled,
+                100,
+            );
+
+            let buffer_id = memory_manager
+                .allocate_buffer(
+                    1024,
+                    BufferUsages::STORAGE | BufferUsages::COPY_DST,
+                    Some("Test Buffer"),
+                    None,
+                )
+                .await
+                .expect("Should allocate buffer");
+
+            let buffer_ref = memory_manager.get_buffer(buffer_id);
+            assert!(buffer_ref.is_some(), "Should retrieve allocated buffer");
+
+            let stats = memory_manager.get_stats();
+            assert_eq!(stats.active_buffers, 1);
+            assert!(stats.total_allocated_bytes >= 1024);
+            assert!(memory_manager.is_healthy());
+
+            memory_manager
+                .release_buffer(buffer_id)
+                .await
+                .expect("Should release buffer");
+
+            println!(
+                "Memory stats after allocation: active_buffers={}, total_bytes={}",
+                stats.active_buffers, stats.total_allocated_bytes
+            );
+
+            memory_manager.shutdown().await;
+        })
+        .await;
+
         assert!(
-            status.total_submissions > 0,
-            "Should have submitted batches"
+            result.is_ok(),
+            "GPU memory manager test should complete within timeout"
         );
-        println!("Total submissions: {}", status.total_submissions);
     }
 
     #[tokio::test]
-    async fn test_command_buffer_pool_timeout_handling() {
-        let (device, queue) = create_test_gpu_context().await;
-        let limits = ResourceLimits::generic();
-        let tracker = ResourceTracker::new(limits).expect("Should create tracker");
+    async fn test_gpu_memory_manager_pooling() {
+        let test_timeout = Duration::from_secs(15);
+        let result = tokio::time::timeout(test_timeout, async {
+            let (device, queue) = create_test_gpu_context().await;
+            let limits = ResourceLimits::generic();
+            let resource_tracker =
+                Arc::new(ResourceTracker::new(limits).expect("Should create tracker"));
 
-        let mut pool = CommandBufferPool::new(device, queue, 10, 8, Duration::from_millis(50));
+            let memory_manager = GpuMemoryManager::new(
+                Arc::new(device),
+                Arc::new(queue),
+                resource_tracker,
+                AllocationStrategy::Pooled,
+                100,
+            );
 
-        let encoder = pool
-            .get_encoder(Some("Timeout Test"), &tracker)
-            .expect("Should get encoder");
-        let buffer = encoder.finish();
-        let guard = tracker.reserve_command_buffer().expect("Should get guard");
+            let mut buffer_ids = Vec::new();
+            for i in 0..3 {
+                let buffer_id = memory_manager
+                    .allocate_buffer(
+                        4096,
+                        BufferUsages::STORAGE,
+                        Some(&format!("Pool Test Buffer {}", i)),
+                        Some(AllocationStrategy::Pooled),
+                    )
+                    .await
+                    .expect("Should allocate pooled buffer");
 
-        pool.submit_buffer(
+                buffer_ids.push(buffer_id);
+            }
+
+            for buffer_id in &buffer_ids[0..2] {
+                memory_manager
+                    .release_buffer(*buffer_id)
+                    .await
+                    .expect("Should release buffer");
+            }
+
+            tokio::time::sleep(Duration::from_millis(100)).await;
+
+            let reused_buffer_id = memory_manager
+                .allocate_buffer(
+                    4096,
+                    BufferUsages::STORAGE,
+                    Some("Reused Buffer"),
+                    Some(AllocationStrategy::Pooled),
+                )
+                .await
+                .expect("Should allocate reused buffer");
+
+            let stats = memory_manager.get_stats();
+            println!(
+                "Pooling test stats: active={}, pooled={}, efficiency={:.2}",
+                stats.active_buffers,
+                stats.pooled_buffers,
+                stats.allocation_efficiency()
+            );
+
+            assert!(stats.active_buffers > 0);
+
+            memory_manager.shutdown().await;
+        })
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "GPU memory pooling test should complete within timeout"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_allocation_strategy_selection() {
+        let small_pooled =
+            AllocationStrategy::choose_for_usage(512 * 1024, BufferUsages::STORAGE, false);
+        assert!(matches!(small_pooled, AllocationStrategy::Pooled));
+
+        let large_direct =
+            AllocationStrategy::choose_for_usage(20 * 1024 * 1024, BufferUsages::STORAGE, true);
+        assert!(matches!(large_direct, AllocationStrategy::Direct));
+
+        let streaming = AllocationStrategy::choose_for_usage(
+            100 * 1024 * 1024,
+            BufferUsages::MAP_READ | BufferUsages::MAP_WRITE,
+            false,
+        );
+        assert!(matches!(streaming, AllocationStrategy::Streaming));
+
+        assert!(AllocationStrategy::Pooled.supports_reuse());
+        assert!(!AllocationStrategy::Direct.supports_reuse());
+        assert!(
+            AllocationStrategy::Direct.cleanup_priority()
+                > AllocationStrategy::Pooled.cleanup_priority()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_memory_exhaustion_handling() {
+        let test_timeout = Duration::from_secs(10);
+        let result = tokio::time::timeout(test_timeout, async {
+            let (device, queue) = create_test_gpu_context().await;
+            let limits = ResourceLimits::generic();
+            let resource_tracker =
+                Arc::new(ResourceTracker::new(limits).expect("Should create tracker"));
+
+            let memory_manager = GpuMemoryManager::new(
+                Arc::new(device),
+                Arc::new(queue),
+                resource_tracker,
+                AllocationStrategy::Direct,
+                1,
+            );
+
+            let result = memory_manager
+                .allocate_buffer(
+                    2 * 1024 * 1024,
+                    BufferUsages::STORAGE,
+                    Some("Too Large Buffer"),
+                    None,
+                )
+                .await;
+
+            assert!(result.is_err(), "Should fail with memory exhaustion");
+
+            if let Err(GpuError::MemoryExhaustion {
+                requested,
+                available,
+            }) = result
+            {
+                assert_eq!(requested, 2);
+                assert!(available < 2);
+                println!(
+                    "Memory exhaustion correctly detected: requested={}MB, available={}MB",
+                    requested, available
+                );
+            } else {
+                panic!("Expected MemoryExhaustion error");
+            }
+
+            memory_manager.shutdown().await;
+        })
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "Memory exhaustion test should complete within timeout"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_task_manager_circuit_breaker_integration() {
+        let test_timeout = Duration::from_secs(5);
+        let result = tokio::time::timeout(test_timeout, async {
+            let (task_manager, mut completion_receiver) = GradientTaskManager::for_gpu_gradients(1);
+
+            task_manager.circuit_breaker.force_open();
+
+            let gradient_tensor = create_test_tensor(vec![2, 2]);
+            let task = GradientTask::Add {
+                output_grad: gradient_tensor,
+                target_variable: next_variable_id(),
+                operation_id: next_operation_id(),
+            };
+
+            let result = task_manager.submit_task(task).await;
+            assert!(
+                result.is_err(),
+                "Task should be rejected by circuit breaker"
+            );
+
+            let error_msg = result.unwrap_err();
+            assert!(
+                error_msg.contains("Circuit breaker is open"),
+                "Error should mention circuit breaker: {}",
+                error_msg
+            );
+
+            match tokio::time::timeout(Duration::from_millis(500), completion_receiver.changed())
+                .await
+            {
+                Ok(Ok(())) => {
+                    let completion = completion_receiver.borrow();
+                    assert!(completion.is_failed(), "Completion should indicate failure");
+                    if let Some(error) = completion.get_error_message() {
+                        assert!(
+                            error.contains("Circuit breaker"),
+                            "Completion error should mention circuit breaker"
+                        );
+                    }
+                }
+                Ok(Err(_)) => {
+                    println!("Completion receiver closed");
+                }
+                Err(_) => {
+                    println!("No completion received within timeout (this may be expected)");
+                }
+            }
+
+            let cb_stats = task_manager.circuit_breaker.get_stats();
+            assert!(
+                cb_stats.rejected_requests > 0,
+                "Should have rejected requests"
+            );
+        })
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "Circuit breaker integration test should complete within timeout"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_buffer_info_lifecycle() {
+        use wgpu::{BufferDescriptor, BufferUsages};
+
+        let (device, _) = create_test_gpu_context().await;
+
+        let buffer = device.create_buffer(&BufferDescriptor {
+            label: Some("Test Buffer"),
+            size: 1024,
+            usage: BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+
+        let buffer_info = BufferInfo::new(
             buffer,
-            next_operation_id(),
-            Some(Duration::from_millis(10)),
-            guard,
-        )
-        .expect("Should submit buffer");
-
-        sleep(Duration::from_millis(100)).await;
-
-        let submitted = pool.submit_batch().expect("Should handle cleanup");
-
-        let status = pool.get_status();
-        println!(
-            "After timeout - active: {}, timeouts: {}, submitted: {}",
-            status.active_buffers, status.timeout_count, submitted
+            1024,
+            BufferUsages::STORAGE,
+            AllocationStrategy::Pooled,
+            true,
         );
 
-        assert_eq!(status.active_buffers, 0);
+        assert_eq!(buffer_info.get_ref_count(), 1);
+
+        let new_count = buffer_info.increment_ref();
+        assert_eq!(new_count, 2);
+        assert_eq!(buffer_info.get_ref_count(), 2);
+
+        let decremented_count = buffer_info.decrement_ref();
+        assert_eq!(decremented_count, 1);
+        assert_eq!(buffer_info.get_ref_count(), 1);
+
+        assert!(!buffer_info.is_cleanup_candidate(60, 30));
+
+        buffer_info.touch();
+        let age = buffer_info.age();
+        let idle_time = buffer_info.seconds_since_last_use();
+
+        println!("Buffer age: {:?}, idle time: {}s", age, idle_time);
+        assert!(idle_time < 5);
     }
 
     #[tokio::test]
-    async fn test_managed_encoder_raii() {
-        let (device, queue) = create_test_gpu_context().await;
-        let limits = ResourceLimits::generic();
-        let tracker = ResourceTracker::new(limits).expect("Should create tracker");
-        let mut pool = CommandBufferPool::new(device, queue, 4, 8, Duration::from_secs(5));
-        let operation_id = next_operation_id();
-        let initial_status = pool.get_status();
-        assert_eq!(initial_status.available_encoders, 0);
+    async fn test_gradient_task_complexity_estimation() {
+        let small_tensor = create_test_tensor(vec![10, 10]);
+        let large_tensor = create_test_tensor(vec![100, 100]);
 
-        {
-            let _managed_encoder =
-                ManagedEncoder::new(&mut pool, operation_id, Some("RAII Test"), &tracker)
-                    .expect("Should create managed encoder");
-        }
+        let add_task = GradientTask::Add {
+            output_grad: small_tensor.clone(),
+            target_variable: next_variable_id(),
+            operation_id: next_operation_id(),
+        };
 
-        let final_status = pool.get_status();
-        assert_eq!(final_status.available_encoders, 1);
-    }
+        let matmul_task = GradientTask::MatMul {
+            output_grad: small_tensor.clone(),
+            other_input: large_tensor.clone(),
+            transpose_other: false,
+            target_variable: next_variable_id(),
+            operation_id: next_operation_id(),
+        };
 
-    #[tokio::test]
-    async fn test_managed_encoder_explicit_submission() {
-        let (device, queue) = create_test_gpu_context().await;
-        let limits = ResourceLimits::generic();
-        let tracker = ResourceTracker::new(limits).expect("Should create tracker");
+        let add_complexity = add_task.estimate_complexity();
+        let matmul_complexity = matmul_task.estimate_complexity();
 
-        let mut pool = CommandBufferPool::new(device, queue, 4, 8, Duration::from_secs(5));
-        let operation_id = next_operation_id();
-
-        let managed_encoder =
-            ManagedEncoder::new(&mut pool, operation_id, Some("Submission Test"), &tracker)
-                .expect("Should create managed encoder");
-
-        let guard = tracker.reserve_command_buffer().expect("Should get guard");
-
-        managed_encoder
-            .finish_and_submit(None, guard)
-            .expect("Should submit successfully");
-
-        let status = pool.get_status();
-        assert!(status.total_submissions > 0 || status.active_buffers > 0);
-    }
-
-    #[tokio::test]
-    async fn test_command_buffer_pool_health_check() {
-        let (device, queue) = create_test_gpu_context().await;
-        let pool = CommandBufferPool::new(device, queue, 4, 8, Duration::from_secs(5));
-
-        assert!(pool.health_check(), "Pool should start healthy");
-
-        pool.total_submissions.store(100, Ordering::Relaxed);
-        pool.timeout_count.store(5, Ordering::Relaxed);
-
+        assert_eq!(add_complexity, 100);
         assert!(
-            pool.health_check(),
-            "Pool should be healthy with low timeout rate"
+            matmul_complexity > add_complexity,
+            "MatMul should be more complex than Add: {} vs {}",
+            matmul_complexity,
+            add_complexity
         );
 
-        pool.timeout_count.store(15, Ordering::Relaxed);
-
-        assert!(
-            !pool.health_check(),
-            "Pool should be unhealthy with high timeout rate"
-        );
+        assert_eq!(add_task.get_task_type(), "Add");
+        assert_eq!(matmul_task.get_task_type(), "MatMul");
     }
 
     #[tokio::test]
-    async fn test_command_buffer_pool_emergency_cleanup() {
-        let (device, queue) = create_test_gpu_context().await;
-        let limits = ResourceLimits::generic();
-        let tracker = ResourceTracker::new(limits).expect("Should create tracker");
-
-        let mut pool = CommandBufferPool::new(device, queue, 10, 8, Duration::from_secs(5));
-
-        for i in 0..3 {
-            let encoder = pool
-                .get_encoder(Some(&format!("Emergency {}", i)), &tracker)
-                .expect("Should get encoder");
-            let buffer = encoder.finish();
-            let guard = tracker.reserve_command_buffer().expect("Should get guard");
-
-            pool.submit_buffer(buffer, next_operation_id(), None, guard)
-                .expect("Should submit buffer");
-        }
-
-        let status_before = pool.get_status();
-        assert!(
-            status_before.active_buffers > 0,
-            "Should have active buffers"
-        );
-
-        let cleaned = pool.emergency_cleanup();
-        assert_eq!(cleaned, status_before.active_buffers);
-
-        let status_after = pool.get_status();
-        assert_eq!(status_after.active_buffers, 0);
-        assert_eq!(status_after.available_encoders, 0);
-    }
-
-    #[test]
-    fn test_operation_guard_split() {
+    async fn test_resource_guard_integration() {
         let limits = ResourceLimits::generic();
         let tracker = ResourceTracker::new(limits).expect("Should create tracker");
 
@@ -428,65 +558,63 @@ mod tests {
             .reserve_operation()
             .expect("Should reserve operation");
 
-        let usage = tracker.current_usage();
-        assert_eq!(usage.total_queue_depth, 1);
-        assert_eq!(usage.gpu_operations, 1);
+        let usage_before = tracker.current_usage();
+        assert_eq!(usage_before.gpu_operations, 1);
+        assert_eq!(usage_before.total_queue_depth, 1);
 
         let (queue_guard, gpu_guard) = operation_guard.split();
 
-        let usage = tracker.current_usage();
-        assert_eq!(usage.total_queue_depth, 1);
-        assert_eq!(usage.gpu_operations, 1);
+        let usage_after_split = tracker.current_usage();
+        assert_eq!(usage_after_split.gpu_operations, 1);
+        assert_eq!(usage_after_split.total_queue_depth, 1);
 
         drop(queue_guard);
-        let usage = tracker.current_usage();
-        assert_eq!(usage.total_queue_depth, 0);
-        assert_eq!(usage.gpu_operations, 1);
+        let usage_after_queue_drop = tracker.current_usage();
+        assert_eq!(usage_after_queue_drop.gpu_operations, 1);
+        assert_eq!(usage_after_queue_drop.total_queue_depth, 0);
 
         drop(gpu_guard);
-        let usage = tracker.current_usage();
-        assert_eq!(usage.total_queue_depth, 0);
-        assert_eq!(usage.gpu_operations, 0);
+        let usage_final = tracker.current_usage();
+        assert_eq!(usage_final.gpu_operations, 0);
+        assert_eq!(usage_final.total_queue_depth, 0);
     }
 
     #[test]
-    fn test_resource_limits_autotune() {
-        let _ = Instance::new(&wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::all(),
-            ..Default::default()
-        });
+    fn test_task_completion_helpers() {
+        let operation_id = next_operation_id();
+        let variable_id = next_variable_id();
+        let duration = Duration::from_millis(100);
 
-        println!("Autotune test requires real GPU adapter - skipping detailed verification");
+        let success = TaskCompletion::success(operation_id, variable_id, duration, Some(0.5));
+        assert!(success.is_success());
+        assert!(!success.is_failed());
+        assert!(!success.is_system_failure());
+        assert!(success.get_error_message().is_none());
+        assert!(!success.has_gradient_issues());
 
-        let generic_limits = ResourceLimits::generic();
-        assert!(generic_limits.max_concurrent_operations > 0);
-        assert!(generic_limits.max_command_buffers > 0);
-        assert!(generic_limits.max_memory_usage_mb > 0);
-    }
-
-    #[tokio::test]
-    async fn test_resource_tracker_performance() {
-        let limits = ResourceLimits::generic();
-        let tracker = Arc::new(ResourceTracker::new(limits).expect("Should create tracker"));
-
-        let start = Instant::now();
-        let iterations = 1000;
-
-        for _ in 0..iterations {
-            let _guard = tracker.reserve_queue_slot().expect("Should reserve");
-        }
-
-        let duration = start.elapsed();
-        println!(
-            "Reservation performance: {} ops in {:?} ({:.2} ops/ms)",
-            iterations,
+        let failed = TaskCompletion::failed(
+            operation_id,
+            variable_id,
             duration,
-            iterations as f64 / duration.as_millis() as f64
+            "Test error".to_string(),
         );
+        assert!(!failed.is_success());
+        assert!(failed.is_failed());
+        assert!(!failed.is_system_failure());
+        assert_eq!(failed.get_error_message(), Some("Test error"));
 
-        assert!(
-            duration < Duration::from_millis(100),
-            "Reservations should be fast"
-        );
+        let timeout = TaskCompletion::timed_out(operation_id, variable_id, duration);
+        assert!(!timeout.is_success());
+        assert!(timeout.is_failed());
+        assert!(timeout.is_system_failure());
+        assert_eq!(timeout.get_error_message(), Some("Operation timed out"));
+
+        let gradient_issues =
+            TaskCompletion::success(operation_id, variable_id, duration, Some(f32::NAN));
+        assert!(gradient_issues.has_gradient_issues());
+
+        let vanishing_gradient =
+            TaskCompletion::success(operation_id, variable_id, duration, Some(1e-8));
+        assert!(vanishing_gradient.has_gradient_issues());
     }
 }

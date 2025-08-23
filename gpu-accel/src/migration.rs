@@ -1347,12 +1347,12 @@ impl Drop for TaskGuard {
 }
 
 pub struct GradientTaskManager {
-    task_queue: flume::Receiver<GradientTask>,
-    task_sender: flume::Sender<GradientTask>,
-    active_tasks: Arc<AtomicUsize>,
-    max_concurrent_tasks: usize,
-    completion_notifier: watch::Sender<TaskCompletion>,
-    circuit_breaker: Arc<CircuitBreaker>,
+    pub task_queue: flume::Receiver<GradientTask>,
+    pub task_sender: flume::Sender<GradientTask>,
+    pub active_tasks: Arc<AtomicUsize>,
+    pub max_concurrent_tasks: usize,
+    pub completion_notifier: watch::Sender<TaskCompletion>,
+    pub circuit_breaker: Arc<CircuitBreaker>,
 
     semaphore: Arc<Semaphore>,
     shutdown_signal: Arc<AtomicBool>,
@@ -1789,10 +1789,10 @@ impl BufferInfo {
 
 #[derive(Debug, Clone)]
 pub struct MemoryStats {
-    total_allocated_bytes: usize,
-    peak_usage_bytes: usize,
-    active_buffers: usize,
-    pooled_buffers: usize,
+    pub total_allocated_bytes: usize,
+    pub peak_usage_bytes: usize,
+    pub active_buffers: usize,
+    pub pooled_buffers: usize,
     cleanup_queue_length: usize,
     allocation_strategy_counts: [usize; 4], // [Direct, Pooled, Lazy, Streaming]
 }
@@ -1962,6 +1962,36 @@ impl GpuMemoryManager {
         }
     }
 
+    async fn try_get_from_pool(&self, size_bytes: usize, usage: BufferUsages) -> Option<BufferId> {
+        let mut pools = self.buffer_pools.lock().await;
+
+        for pool in pools.iter_mut() {
+            if pool.usage.contains(usage) {
+                if let Some(buffer_id) = pool.try_get_buffer(size_bytes) {
+                    if let Some(entry) = self.allocated_buffers.get(&buffer_id) {
+                        let buffer_info = entry.value();
+
+                        buffer_info.touch();
+                        buffer_info.increment_ref();
+
+                        debug!(
+                            buffer_id = ?buffer_id,
+                            size_bytes = size_bytes,
+                            pool_hit_rate = pool.hit_rate(),
+                            "Retrieved buffer from pool"
+                        );
+
+                        return Some(buffer_id);
+                    } else {
+                        warn!(buffer_id = ?buffer_id, "Buffer in pool but not in allocated_buffers");
+                    }
+                }
+            }
+        }
+
+        return None;
+    }
+
     /// Allocate a new GPU buffer with the specified parameters
     pub async fn allocate_buffer(
         &self,
@@ -2069,36 +2099,6 @@ impl GpuMemoryManager {
         Ok(())
     }
 
-    async fn try_get_from_pool(&self, size_bytes: usize, usage: BufferUsages) -> Option<BufferId> {
-        let mut pools = self.buffer_pools.lock().await;
-
-        for pool in pools.iter_mut() {
-            if pool.usage.contains(usage) {
-                if let Some(buffer_id) = pool.try_get_buffer(size_bytes) {
-                    if let Some(entry) = self.allocated_buffers.get(&buffer_id) {
-                        let buffer_info = entry.value();
-
-                        buffer_info.touch();
-                        buffer_info.increment_ref();
-
-                        debug!(
-                            buffer_id = ?buffer_id,
-                            size_bytes = size_bytes,
-                            pool_hit_rate = pool.hit_rate(),
-                            "Retrieved buffer from pool"
-                        );
-
-                        return Some(buffer_id);
-                    } else {
-                        warn!(buffer_id = ?buffer_id, "Buffer in pool but not in allocated_buffers");
-                    }
-                }
-            }
-        }
-
-        return None;
-    }
-
     /// Try to return a buffer to the pool
     async fn try_return_to_pool(&self, buffer_id: BufferId) -> bool {
         if let Some(entry) = self.allocated_buffers.get(&buffer_id) {
@@ -2143,31 +2143,6 @@ impl GpuMemoryManager {
                     age_seconds = buffer_info.age().as_secs(),
                     "Deallocated GPU buffer"
                 );
-            }
-        }
-    }
-
-    /// Run the cleanup background task
-    pub async fn run_cleanup_task(&self) {
-        info!("Starting GPU memory cleanup task");
-
-        let mut cleanup_receiver = self.cleanup_receiver.lock().await;
-        let mut cleanup_timer = tokio::time::interval(self.cleanup_interval);
-
-        loop {
-            tokio::select! {
-                buffer_id = cleanup_receiver.recv() => {
-                    if let Some(buffer_id) = buffer_id {
-                        self.cleanup_buffer(buffer_id).await;
-                    } else {
-                        info!("Cleanup channel closed, stopping cleanup task");
-                        break;
-                    }
-                }
-
-                _ = cleanup_timer.tick() => {
-                    self.periodic_cleanup().await;
-                }
             }
         }
     }
@@ -2223,6 +2198,31 @@ impl GpuMemoryManager {
         }
 
         self.cleanup_runs.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Run the cleanup background task
+    pub async fn run_cleanup_task(&self) {
+        info!("Starting GPU memory cleanup task");
+
+        let mut cleanup_receiver = self.cleanup_receiver.lock().await;
+        let mut cleanup_timer = tokio::time::interval(self.cleanup_interval);
+
+        loop {
+            tokio::select! {
+                buffer_id = cleanup_receiver.recv() => {
+                    if let Some(buffer_id) = buffer_id {
+                        self.cleanup_buffer(buffer_id).await;
+                    } else {
+                        info!("Cleanup channel closed, stopping cleanup task");
+                        break;
+                    }
+                }
+
+                _ = cleanup_timer.tick() => {
+                    self.periodic_cleanup().await;
+                }
+            }
+        }
     }
 
     /// Emergency cleanup when memory is running low
