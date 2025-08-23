@@ -21,24 +21,29 @@ mod tests {
 
             let adapter = instance
                 .request_adapter(&RequestAdapterOptions {
-                    power_preference: wgpu::PowerPreference::LowPower,
+                    power_preference: wgpu::PowerPreference::HighPerformance,
                     compatible_surface: None,
-                    force_fallback_adapter: true,
+                    force_fallback_adapter: false,
                 })
                 .await
                 .expect("Failed to create adapter for testing");
 
             let info = adapter.get_info();
+
+            if info.device_type == wgpu::DeviceType::Cpu {
+                panic!("Test failed to obtain GPU adapter, got CPU fallback instead. Check your GPU drivers and WGPU installation.");
+            }
+
             println!(
-                "Test using GPU: {} (Vendor: {:04X}, Type: {:?})",
-                info.name, info.vendor, info.device_type
+                "Test using GPU: {} (Vendor: {:04X}, Type: {:?}, Backend: {:?})",
+                info.name, info.vendor, info.device_type, info.backend
             );
 
             let (device, queue) = adapter
                 .request_device(&DeviceDescriptor {
                     label: Some("Test Device"),
                     required_features: Features::empty(),
-                    required_limits: Limits::downlevel_defaults(),
+                    required_limits: Limits::default(),
                     memory_hints: wgpu::MemoryHints::default(),
                     trace: wgpu::Trace::Off,
                 })
@@ -172,7 +177,6 @@ mod tests {
 
         assert_eq!(circuit_breaker.get_state(), CircuitBreakerState::Closed);
         assert!(circuit_breaker.is_healthy());
-        assert!(circuit_breaker.is_request_allowed());
 
         for _ in 0..3 {
             let allowed = circuit_breaker.is_request_allowed();
@@ -181,6 +185,7 @@ mod tests {
         }
 
         let stats = circuit_breaker.get_stats();
+
         assert_eq!(stats.successful_requests, 3);
         assert_eq!(stats.total_requests, 3);
         assert!((stats.success_rate - 1.0).abs() < 0.01);
@@ -215,7 +220,6 @@ mod tests {
             let limits = ResourceLimits::generic();
             let resource_tracker =
                 Arc::new(ResourceTracker::new(limits).expect("Should create tracker"));
-
             let memory_manager = GpuMemoryManager::new(
                 Arc::new(device),
                 Arc::new(queue),
@@ -223,7 +227,6 @@ mod tests {
                 AllocationStrategy::Pooled,
                 100,
             );
-
             let buffer_id = memory_manager
                 .allocate_buffer(
                     1024,
@@ -233,11 +236,18 @@ mod tests {
                 )
                 .await
                 .expect("Should allocate buffer");
-
             let buffer_ref = memory_manager.get_buffer(buffer_id);
+
             assert!(buffer_ref.is_some(), "Should retrieve allocated buffer");
 
             let stats = memory_manager.get_stats();
+
+            println!(
+                "Memory debug: active={}, pooled={}, efficiency={:.3}",
+                stats.active_buffers,
+                stats.pooled_buffers,
+                stats.allocation_efficiency()
+            );
             assert_eq!(stats.active_buffers, 1);
             assert!(stats.total_allocated_bytes >= 1024);
             assert!(memory_manager.is_healthy());

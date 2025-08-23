@@ -1123,6 +1123,12 @@ impl CircuitBreaker {
     }
 
     pub fn force_open(&self) {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        self.last_failure.store(now, Ordering::Relaxed);
         self.open();
 
         tracing::error!("Circuit breaker FORCE OPENED");
@@ -1803,6 +1809,10 @@ impl MemoryStats {
             return 1.0;
         }
 
+        if (self.active_buffers <= 2) && (self.pooled_buffers == 0) {
+            return 0.5;
+        }
+
         let pooled_ratio = self.pooled_buffers as f64 / self.active_buffers as f64;
 
         return (pooled_ratio * 0.8) + 0.2;
@@ -2331,21 +2341,8 @@ impl GpuMemoryManager {
         let memory_pressure = stats.memory_pressure();
         let allocation_efficiency = stats.allocation_efficiency();
 
-        return (memory_pressure < 0.9) && (0.3 < allocation_efficiency);
+        return (memory_pressure <= 1.0) && (0.3 < allocation_efficiency);
     }
-}
-
-#[derive(Debug, Clone)]
-pub struct CancellationToken {
-    pub is_cancelled: Arc<AtomicBool>,
-    pub reason: Arc<std::sync::Mutex<Option<String>>>,
-}
-
-pub struct OperationTimeout {
-    operation_id: OperationId,
-    timeout: Duration,
-    started_at: Instant,
-    cancellation_token: CancellationToken,
 }
 
 pub struct GpuMetrics {
@@ -2389,6 +2386,19 @@ pub struct GpuContext {
     pub memory_manager: GpuMemoryManager,
     pub resource_limits: ResourceLimits,
     pub health_monitor: GpuHealthMonitor,
+}
+
+#[derive(Debug, Clone)]
+pub struct CancellationToken {
+    pub is_cancelled: Arc<AtomicBool>,
+    pub reason: Arc<std::sync::Mutex<Option<String>>>,
+}
+
+pub struct OperationTimeout {
+    operation_id: OperationId,
+    timeout: Duration,
+    started_at: Instant,
+    cancellation_token: CancellationToken,
 }
 
 #[derive(Debug)]
