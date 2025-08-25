@@ -2481,7 +2481,7 @@ impl GpuHealthMonitor {
         let std_dev = variance.sqrt();
         let coefficient_of_variation = if overall_mean > 0.0 { std_dev / overall_mean } else { 0.0 };
 
-        if coefficient_of_variation > 1.0 {
+        if coefficient_of_variation > 0.6 {
             return DepthTrend::Volatile;
         }
 
@@ -2496,7 +2496,7 @@ impl GpuHealthMonitor {
             relative_change = 0.0
         };
 
-        if relative_change < 0.1 {
+        if relative_change < 0.15 {
             return DepthTrend::Stable;
         } else if trend_diff > 0.0 {
             return DepthTrend::Increasing;
@@ -2514,7 +2514,7 @@ impl GpuHealthMonitor {
         let is_stable = match depth_trend {
             DepthTrend::Stable => current_depth < 100,
             DepthTrend::Decreasing => current_depth < 150,
-            DepthTrend::Increasing => current_depth < 50,
+            DepthTrend::Increasing => current_depth < 25,
             DepthTrend::Volatile => false,
         };
 

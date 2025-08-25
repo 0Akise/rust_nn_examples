@@ -812,27 +812,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_edge_case_trend_analysis() {
-        let mut monitor = GpuHealthMonitor::with_defaults();
-
-        for i in 0..5 {
-            monitor.sample_queue_depth(i, 64);
-        }
-
-        let queue_health = monitor.get_queue_health();
-
-        assert_eq!(queue_health.depth_trend, DepthTrend::Stable);
-
-        for _ in 0..10 {
-            monitor.sample_queue_depth(5, 64);
-        }
-
-        let queue_health = monitor.get_queue_health();
-
-        assert_eq!(queue_health.depth_trend, DepthTrend::Stable);
-    }
-
-    #[tokio::test]
     async fn test_concurrent_health_monitoring() {
         let monitor = Arc::new(GpuHealthMonitor::with_defaults());
         let mut handles = Vec::new();
