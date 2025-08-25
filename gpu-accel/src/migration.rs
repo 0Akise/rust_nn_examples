@@ -9,10 +9,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::sync::{Mutex, Semaphore};
 use tokio::time::{sleep, timeout};
 use tracing::{debug, error, info, warn};
-use wgpu::{
-    Adapter, AdapterInfo, Buffer, BufferDescriptor, BufferUsages, CommandBuffer, CommandEncoder,
-    CommandEncoderDescriptor, Device, DeviceType, Limits, Queue,
-};
+use wgpu::{Adapter, AdapterInfo, Buffer, BufferDescriptor, BufferUsages, CommandBuffer, CommandEncoder, CommandEncoderDescriptor, Device, DeviceType, Limits, Queue};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct OperationId(pub u64);
@@ -77,10 +74,7 @@ pub enum ComputationResult {
 #[derive(thiserror::Error, Debug)]
 pub enum GpuError {
     #[error("Operation timeout after {timeout:?}")]
-    Timeout {
-        timeout: Duration,
-        operation_id: OperationId,
-    },
+    Timeout { timeout: Duration, operation_id: OperationId },
 
     #[error("Queue overflow: {active}/{limit} operations")]
     QueueOverflow { active: usize, limit: usize },
@@ -262,10 +256,7 @@ impl ResourceTracker {
         return Ok(());
     }
 
-    pub fn start_gpu_execution(
-        &'_ self,
-        _queue_guard: &QueueSlotGuard,
-    ) -> Result<GpuExecutionGuard<'_>, GpuError> {
+    pub fn start_gpu_execution(&'_ self, _queue_guard: &QueueSlotGuard) -> Result<GpuExecutionGuard<'_>, GpuError> {
         self.can_start_gpu_execution()?;
 
         let prev_ops = self.current_operations.fetch_add(1, Ordering::AcqRel);
@@ -308,10 +299,7 @@ impl ResourceTracker {
         let queue_guard = self.reserve_queue_slot()?;
         let gpu_guard = self.start_gpu_execution(&queue_guard)?;
 
-        return Ok(OperationGuard {
-            queue_guard,
-            gpu_guard,
-        });
+        return Ok(OperationGuard { queue_guard, gpu_guard });
     }
 
     pub fn reserve_command_buffer(&'_ self) -> Result<CommandBufferGuard<'_>, GpuError> {
@@ -336,9 +324,7 @@ impl ResourceTracker {
 
     pub fn reserve_memory(&'_ self, size_mb: usize) -> Result<MemoryGuard<'_>, GpuError> {
         self.can_allocate_memory(size_mb)?;
-
-        self.current_memory_usage_mb
-            .fetch_add(size_mb, Ordering::AcqRel);
+        self.current_memory_usage_mb.fetch_add(size_mb, Ordering::AcqRel);
 
         return Ok(MemoryGuard {
             tracker: self,
@@ -389,9 +375,7 @@ pub struct GpuExecutionGuard<'a> {
 
 impl<'a> Drop for GpuExecutionGuard<'a> {
     fn drop(&mut self) {
-        self.tracker
-            .current_operations
-            .fetch_sub(1, Ordering::AcqRel);
+        self.tracker.current_operations.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -404,7 +388,6 @@ pub struct OperationGuard<'a> {
 impl<'a> OperationGuard<'a> {
     pub fn split(self) -> (QueueSlotGuard<'a>, GpuExecutionGuard<'a>) {
         let manual = ManuallyDrop::new(self);
-
         let queue_guard = unsafe { std::ptr::read(&manual.queue_guard) };
         let gpu_guard = unsafe { std::ptr::read(&manual.gpu_guard) };
 
@@ -420,9 +403,7 @@ pub struct CommandBufferGuard<'a> {
 
 impl<'a> Drop for CommandBufferGuard<'a> {
     fn drop(&mut self) {
-        self.tracker
-            .current_command_buffers
-            .fetch_sub(1, Ordering::AcqRel);
+        self.tracker.current_command_buffers.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -435,9 +416,7 @@ pub struct MemoryGuard<'a> {
 
 impl<'a> Drop for MemoryGuard<'a> {
     fn drop(&mut self) {
-        self.tracker
-            .current_memory_usage_mb
-            .fetch_sub(self.size_mb, Ordering::AcqRel);
+        self.tracker.current_memory_usage_mb.fetch_sub(self.size_mb, Ordering::AcqRel);
     }
 }
 
@@ -493,13 +472,7 @@ pub struct CommandBufferPool {
 }
 
 impl CommandBufferPool {
-    pub fn new(
-        device: wgpu::Device,
-        queue: wgpu::Queue,
-        batch_size: usize,
-        max_active_buffers: usize,
-        default_timeout: Duration,
-    ) -> Self {
+    pub fn new(device: wgpu::Device, queue: wgpu::Queue, batch_size: usize, max_active_buffers: usize, default_timeout: Duration) -> Self {
         return Self {
             device,
             queue,
@@ -515,17 +488,11 @@ impl CommandBufferPool {
     }
 
     /// Get a command encoder, either from pool or create new
-    pub fn get_encoder(
-        &mut self,
-        label: Option<&str>,
-        _resource_tracker: &ResourceTracker,
-    ) -> Result<CommandEncoder, GpuError> {
+    pub fn get_encoder(&mut self, label: Option<&str>, _resource_tracker: &ResourceTracker) -> Result<CommandEncoder, GpuError> {
         if let Some(encoder) = self.available_encoders.pop_front() {
             return Ok(encoder);
         } else {
-            let encoder = self
-                .device
-                .create_command_encoder(&CommandEncoderDescriptor { label });
+            let encoder = self.device.create_command_encoder(&CommandEncoderDescriptor { label });
             return Ok(encoder);
         }
     }
@@ -554,11 +521,7 @@ impl CommandBufferPool {
         let cleaned_count = initial_count - self.active_buffers.len();
 
         if 0 < cleaned_count {
-            tracing::debug!(
-                cleaned_buffers = cleaned_count,
-                remaining_buffers = self.active_buffers.len(),
-                "Cleaned up timed out command buffers"
-            );
+            tracing::debug!(cleaned_buffers = cleaned_count, remaining_buffers = self.active_buffers.len(), "Cleaned up timed out command buffers");
         }
     }
 
@@ -590,19 +553,16 @@ impl CommandBufferPool {
         }
 
         let pre_cleanup_count = self.active_buffers.len();
+
         self.cleanup_timed_out_buffers();
+
         let post_cleanup_count = self.active_buffers.len();
 
         if self.active_buffers.is_empty() == true {
             return Ok(0);
         }
 
-        let buffers: Vec<CommandBuffer> = self
-            .active_buffers
-            .drain(..)
-            .map(|active| active.buffer)
-            .collect();
-
+        let buffers: Vec<CommandBuffer> = self.active_buffers.drain(..).map(|active| active.buffer).collect();
         let count = buffers.len();
 
         self.queue.submit(buffers);
@@ -620,13 +580,7 @@ impl CommandBufferPool {
     }
 
     /// Submit a command buffer to the pool for batched execution
-    pub fn submit_buffer(
-        &mut self,
-        buffer: CommandBuffer,
-        operation_id: OperationId,
-        timeout: Option<Duration>,
-        _guard: CommandBufferGuard<'_>,
-    ) -> Result<(), GpuError> {
+    pub fn submit_buffer(&mut self, buffer: CommandBuffer, operation_id: OperationId, timeout: Option<Duration>, _guard: CommandBufferGuard<'_>) -> Result<(), GpuError> {
         if self.max_active_buffers <= self.active_buffers.len() {
             return Err(GpuError::QueueOverflow {
                 active: self.active_buffers.len(),
@@ -659,17 +613,7 @@ impl CommandBufferPool {
     }
 
     pub fn get_pending_operations(&self) -> Vec<(OperationId, Duration, Duration)> {
-        return self
-            .active_buffers
-            .iter()
-            .map(|buffer| {
-                (
-                    buffer.operation_id,
-                    buffer.created_at.elapsed(),
-                    buffer.get_remaining_time(),
-                )
-            })
-            .collect();
+        return self.active_buffers.iter().map(|buffer| (buffer.operation_id, buffer.created_at.elapsed(), buffer.get_remaining_time())).collect();
     }
 
     /// Emergency cleanup - drop all pending buffers
@@ -677,10 +621,7 @@ impl CommandBufferPool {
         let count = self.active_buffers.len();
 
         if 0 < count {
-            tracing::error!(
-                dropped_buffers = count,
-                "Emergency cleanup - dropping all pending command buffers"
-            );
+            tracing::error!(dropped_buffers = count, "Emergency cleanup - dropping all pending command buffers");
 
             self.active_buffers.clear();
             self.available_encoders.clear();
@@ -691,10 +632,7 @@ impl CommandBufferPool {
 
     /// Get current pool statistics
     pub fn get_status(&self) -> CommandBufferStatus {
-        let oldest_buffer_age = self
-            .active_buffers
-            .first()
-            .map(|buffer| buffer.created_at.elapsed());
+        let oldest_buffer_age = self.active_buffers.first().map(|buffer| buffer.created_at.elapsed());
 
         CommandBufferStatus {
             active_buffers: self.active_buffers.len(),
@@ -739,12 +677,7 @@ pub struct ManagedEncoder<'a> {
 }
 
 impl<'a> ManagedEncoder<'a> {
-    pub fn new(
-        pool: &'a mut CommandBufferPool,
-        operation_id: OperationId,
-        label: Option<&str>,
-        resource_tracker: &ResourceTracker,
-    ) -> Result<Self, GpuError> {
+    pub fn new(pool: &'a mut CommandBufferPool, operation_id: OperationId, label: Option<&str>, resource_tracker: &ResourceTracker) -> Result<Self, GpuError> {
         let encoder = pool.get_encoder(label, resource_tracker)?;
 
         Ok(Self {
@@ -758,16 +691,11 @@ impl<'a> ManagedEncoder<'a> {
         return self.encoder.as_mut().expect("Encoder already consumed");
     }
 
-    pub fn finish_and_submit(
-        mut self,
-        timeout: Option<Duration>,
-        guard: CommandBufferGuard<'a>,
-    ) -> Result<(), GpuError> {
+    pub fn finish_and_submit(mut self, timeout: Option<Duration>, guard: CommandBufferGuard<'a>) -> Result<(), GpuError> {
         let encoder = self.encoder.take().expect("Encoder already consumed");
         let buffer = encoder.finish();
 
-        self.pool
-            .submit_buffer(buffer, self.operation_id, timeout, guard)
+        self.pool.submit_buffer(buffer, self.operation_id, timeout, guard)
     }
 }
 
@@ -798,12 +726,7 @@ pub struct TaskCompletion {
 
 impl TaskCompletion {
     /// Create a successful task completion
-    pub fn success(
-        operation_id: OperationId,
-        variable_id: VariableId,
-        duration: Duration,
-        gradient_norm: Option<f32>,
-    ) -> Self {
+    pub fn success(operation_id: OperationId, variable_id: VariableId, duration: Duration, gradient_norm: Option<f32>) -> Self {
         return Self {
             operation_id,
             variable_id,
@@ -814,12 +737,7 @@ impl TaskCompletion {
     }
 
     /// Create a failed task completion
-    pub fn failed(
-        operation_id: OperationId,
-        variable_id: VariableId,
-        duration: Duration,
-        error: String,
-    ) -> Self {
+    pub fn failed(operation_id: OperationId, variable_id: VariableId, duration: Duration, error: String) -> Self {
         return Self {
             operation_id,
             variable_id,
@@ -830,11 +748,7 @@ impl TaskCompletion {
     }
 
     /// Create a timeout task completion
-    pub fn timed_out(
-        operation_id: OperationId,
-        variable_id: VariableId,
-        duration: Duration,
-    ) -> Self {
+    pub fn timed_out(operation_id: OperationId, variable_id: VariableId, duration: Duration) -> Self {
         return Self {
             operation_id,
             variable_id,
@@ -845,11 +759,7 @@ impl TaskCompletion {
     }
 
     /// Create a cancelled task completion
-    pub fn cancelled(
-        operation_id: OperationId,
-        variable_id: VariableId,
-        duration: Duration,
-    ) -> Self {
+    pub fn cancelled(operation_id: OperationId, variable_id: VariableId, duration: Duration) -> Self {
         return Self {
             operation_id,
             variable_id,
@@ -887,13 +797,7 @@ impl TaskCompletion {
         }
     }
 
-    pub fn from_timed_result<T, E>(
-        operation_id: OperationId,
-        variable_id: VariableId,
-        start_time: Instant,
-        result: Result<T, E>,
-        gradient_norm: Option<f32>,
-    ) -> Self
+    pub fn from_timed_result<T, E>(operation_id: OperationId, variable_id: VariableId, start_time: Instant, result: Result<T, E>, gradient_norm: Option<f32>) -> Self
     where
         E: std::fmt::Display,
     {
@@ -1018,10 +922,7 @@ pub struct CircuitBreaker {
 
 impl CircuitBreaker {
     pub fn new(failure_threshold: usize, recovery_timeout: Duration) -> Self {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
 
         return Self {
             state: AtomicU8::new(CircuitBreakerState::Closed as u8),
@@ -1042,10 +943,7 @@ impl CircuitBreaker {
 
     /// Check if circuit breaker should attempt recovery
     fn should_attempt_recovery(&self) -> bool {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
         let last_failure = self.last_failure.load(Ordering::Acquire);
         let time_since_failure = Duration::from_secs(now.saturating_sub(last_failure));
 
@@ -1059,12 +957,9 @@ impl CircuitBreaker {
 
     /// Get time spent in current state
     fn get_time_in_current_state(&self) -> Duration {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
         let last_change = self.last_state_change.load(Ordering::Relaxed);
+
         Duration::from_secs(now.saturating_sub(last_change))
     }
 
@@ -1093,40 +988,31 @@ impl CircuitBreaker {
 
     /// Update the last state change timestamp
     fn update_state_change_time(&self) {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
 
         self.last_state_change.store(now, Ordering::Relaxed);
     }
 
     fn open(&self) {
-        self.state
-            .store(CircuitBreakerState::Open as u8, Ordering::Release);
+        self.state.store(CircuitBreakerState::Open as u8, Ordering::Release);
         self.update_state_change_time();
     }
 
     fn open_half(&self) {
-        self.state
-            .store(CircuitBreakerState::HalfOpen as u8, Ordering::Release);
+        self.state.store(CircuitBreakerState::HalfOpen as u8, Ordering::Release);
         self.update_state_change_time();
 
         tracing::info!("Circuit breaker transitioning to HALF_OPEN");
     }
 
     fn close(&self) {
-        self.state
-            .store(CircuitBreakerState::Closed as u8, Ordering::Release);
+        self.state.store(CircuitBreakerState::Closed as u8, Ordering::Release);
         self.failure_count.store(0, Ordering::Relaxed);
         self.update_state_change_time();
     }
 
     pub fn force_open(&self) {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
 
         self.last_failure.store(now, Ordering::Relaxed);
         self.open();
@@ -1189,10 +1075,7 @@ impl CircuitBreaker {
 
     /// Record a failed operation
     pub fn record_failure(&self) {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
 
         self.last_failure.store(now, Ordering::Relaxed);
 
@@ -1267,18 +1150,10 @@ impl GradientTask {
     /// Get the target variable ID for this task
     pub fn get_target_variable(&self) -> VariableId {
         match self {
-            GradientTask::Add {
-                target_variable, ..
-            } => *target_variable,
-            GradientTask::Mul {
-                target_variable, ..
-            } => *target_variable,
-            GradientTask::MatMul {
-                target_variable, ..
-            } => *target_variable,
-            GradientTask::Transpose {
-                target_variable, ..
-            } => *target_variable,
+            GradientTask::Add { target_variable, .. } => *target_variable,
+            GradientTask::Mul { target_variable, .. } => *target_variable,
+            GradientTask::MatMul { target_variable, .. } => *target_variable,
+            GradientTask::Transpose { target_variable, .. } => *target_variable,
         }
     }
 
@@ -1297,11 +1172,7 @@ impl GradientTask {
         match self {
             GradientTask::Add { output_grad, .. } => output_grad.shape.dims.iter().product(),
             GradientTask::Mul { output_grad, .. } => output_grad.shape.dims.iter().product(),
-            GradientTask::MatMul {
-                output_grad,
-                other_input,
-                ..
-            } => {
+            GradientTask::MatMul { output_grad, other_input, .. } => {
                 let m = output_grad.shape.dims.get(0).unwrap_or(&1);
                 let n = other_input.shape.dims.get(1).unwrap_or(&1);
                 let k = other_input.shape.dims.get(0).unwrap_or(&1);
@@ -1329,16 +1200,9 @@ pub struct TaskManagerStats {
 impl TaskManagerStats {
     /// Check if stats indicate problems
     pub fn indicates_problems(&self) -> bool {
-        let failure_rate = if self.total_submitted > 0 {
-            self.total_failed as f64 / self.total_submitted as f64
-        } else {
-            0.0
-        };
+        let failure_rate = if self.total_submitted > 0 { self.total_failed as f64 / self.total_submitted as f64 } else { 0.0 };
 
-        return self.is_shutdown
-            || self.circuit_breaker_stats.indicates_problems()
-            || failure_rate > 0.1
-            || (self.queue_length > 1000 && self.active_tasks == self.max_concurrent_tasks);
+        return self.is_shutdown || self.circuit_breaker_stats.indicates_problems() || failure_rate > 0.1 || (self.queue_length > 1000 && self.active_tasks == self.max_concurrent_tasks);
     }
 }
 
@@ -1371,18 +1235,9 @@ pub struct GradientTaskManager {
 
 impl GradientTaskManager {
     /// Create a new gradient task manager
-    pub fn new(
-        max_concurrent_tasks: usize,
-        circuit_breaker: CircuitBreaker,
-        task_timeout: Duration,
-    ) -> (Self, watch::Receiver<TaskCompletion>) {
+    pub fn new(max_concurrent_tasks: usize, circuit_breaker: CircuitBreaker, task_timeout: Duration) -> (Self, watch::Receiver<TaskCompletion>) {
         let (task_sender, task_queue) = flume::unbounded();
-        let (completion_notifier, completion_receiver) = watch::channel(TaskCompletion::success(
-            OperationId(0),
-            VariableId(0),
-            Duration::from_millis(0),
-            None,
-        ));
+        let (completion_notifier, completion_receiver) = watch::channel(TaskCompletion::success(OperationId(0), VariableId(0), Duration::from_millis(0), None));
 
         return (
             Self {
@@ -1404,14 +1259,8 @@ impl GradientTaskManager {
     }
 
     /// Create a task manager optimized for GPU gradient computation
-    pub fn for_gpu_gradients(
-        max_concurrent_tasks: usize,
-    ) -> (Self, watch::Receiver<TaskCompletion>) {
-        Self::new(
-            max_concurrent_tasks,
-            CircuitBreaker::for_gpu_operations(),
-            Duration::from_secs(10),
-        )
+    pub fn for_gpu_gradients(max_concurrent_tasks: usize) -> (Self, watch::Receiver<TaskCompletion>) {
+        Self::new(max_concurrent_tasks, CircuitBreaker::for_gpu_operations(), Duration::from_secs(10))
     }
 
     /// Submit a gradient task for execution
@@ -1421,31 +1270,20 @@ impl GradientTaskManager {
         }
 
         if self.circuit_breaker.is_request_allowed() == false {
-            let completion = TaskCompletion::failed(
-                task.get_operation_id(),
-                task.get_target_variable(),
-                Duration::from_millis(0),
-                "Circuit breaker is open".to_string(),
-            );
-
+            let completion = TaskCompletion::failed(task.get_operation_id(), task.get_target_variable(), Duration::from_millis(0), "Circuit breaker is open".to_string());
             let _ = self.completion_notifier.send(completion);
+
             return Err("Circuit breaker is open, rejecting task".to_string());
         }
 
         self.total_tasks_submitted.fetch_add(1, Ordering::Relaxed);
-        self.task_sender
-            .send_async(task)
-            .await
-            .map_err(|_| "Failed to queue task, manager may be shutting down".to_string())?;
+        self.task_sender.send_async(task).await.map_err(|_| "Failed to queue task, manager may be shutting down".to_string())?;
 
         return Ok(());
     }
 
     pub async fn run(&self, resource_tracker: Arc<ResourceTracker>) {
-        info!(
-            "Starting gradient task manager with {} max concurrent tasks",
-            self.max_concurrent_tasks
-        );
+        info!("Starting gradient task manager with {} max concurrent tasks", self.max_concurrent_tasks);
 
         loop {
             if self.shutdown_signal.load(Ordering::Acquire) {
@@ -1479,42 +1317,22 @@ impl GradientTaskManager {
             tokio::spawn(async move {
                 active_tasks.fetch_add(1, Ordering::Relaxed);
 
-                let _guard = TaskGuard {
-                    active_tasks: active_tasks.clone(),
-                };
+                let _ = TaskGuard { active_tasks: active_tasks.clone() };
                 let start_time = Instant::now();
-                let result = timeout(
-                    task_timeout,
-                    Self::execute_gradient_task(task.clone(), resource_tracker, shutdown_signal),
-                )
-                .await;
+                let result = timeout(task_timeout, Self::execute_gradient_task(task.clone(), resource_tracker, shutdown_signal)).await;
 
                 let completion = match result {
                     Ok(Ok(gradient_norm)) => {
                         circuit_breaker.record_success();
-                        TaskCompletion::success(
-                            task.get_operation_id(),
-                            task.get_target_variable(),
-                            start_time.elapsed(),
-                            gradient_norm,
-                        )
+                        TaskCompletion::success(task.get_operation_id(), task.get_target_variable(), start_time.elapsed(), gradient_norm)
                     }
                     Ok(Err(error)) => {
                         circuit_breaker.record_failure();
-                        TaskCompletion::failed(
-                            task.get_operation_id(),
-                            task.get_target_variable(),
-                            start_time.elapsed(),
-                            error,
-                        )
+                        TaskCompletion::failed(task.get_operation_id(), task.get_target_variable(), start_time.elapsed(), error)
                     }
                     Err(_) => {
                         circuit_breaker.record_failure();
-                        TaskCompletion::timed_out(
-                            task.get_operation_id(),
-                            task.get_target_variable(),
-                            start_time.elapsed(),
-                        )
+                        TaskCompletion::timed_out(task.get_operation_id(), task.get_target_variable(), start_time.elapsed())
                     }
                 };
 
@@ -1541,25 +1359,15 @@ impl GradientTaskManager {
     }
 
     /// Execute a gradient task
-    async fn execute_gradient_task(
-        task: GradientTask,
-        resource_tracker: Arc<ResourceTracker>,
-        shutdown_signal: Arc<AtomicBool>,
-    ) -> Result<Option<f32>, String> {
+    async fn execute_gradient_task(task: GradientTask, resource_tracker: Arc<ResourceTracker>, shutdown_signal: Arc<AtomicBool>) -> Result<Option<f32>, String> {
         if shutdown_signal.load(Ordering::Acquire) == true {
             return Err("Shutdown requested".to_string());
         }
 
-        let _operation_guard = resource_tracker
-            .reserve_operation()
-            .map_err(|e| format!("Failed to reserve GPU resources: {}", e))?;
+        let _ = resource_tracker.reserve_operation().map_err(|e| format!("Failed to reserve GPU resources: {}", e))?;
 
         match task {
-            GradientTask::Add {
-                output_grad,
-                target_variable,
-                ..
-            } => {
+            GradientTask::Add { output_grad, target_variable, .. } => {
                 let norm = Self::compute_gradient_norm(&output_grad);
 
                 info!(target_variable = ?target_variable, gradient_norm = norm, "Computed Add gradient");
@@ -1596,11 +1404,7 @@ impl GradientTaskManager {
 
                 Ok(Some(norm))
             }
-            GradientTask::Transpose {
-                output_grad,
-                target_variable,
-                ..
-            } => {
+            GradientTask::Transpose { output_grad, target_variable, .. } => {
                 let norm = Self::compute_gradient_norm(&output_grad);
 
                 info!(target_variable = ?target_variable, gradient_norm = norm, "Computed Transpose gradient");
@@ -1617,7 +1421,6 @@ impl GradientTaskManager {
         self.shutdown_signal.store(true, Ordering::Release);
 
         let _ = &self.task_sender;
-
         let shutdown_timeout = Duration::from_secs(30);
         let start = Instant::now();
 
@@ -1635,13 +1438,14 @@ impl GradientTaskManager {
     /// Force emergency shutdown
     pub fn emergency_shutdown(&self) {
         error!("Emergency shutdown triggered");
+
         self.shutdown_signal.store(true, Ordering::Release);
         self.circuit_breaker.force_open();
     }
 
     /// Get current task manager statistics
     pub fn get_stats(&self) -> TaskManagerStats {
-        TaskManagerStats {
+        return TaskManagerStats {
             active_tasks: self.active_tasks.load(Ordering::Acquire),
             max_concurrent_tasks: self.max_concurrent_tasks,
             total_submitted: self.total_tasks_submitted.load(Ordering::Acquire),
@@ -1651,14 +1455,12 @@ impl GradientTaskManager {
             available_permits: self.semaphore.available_permits(),
             circuit_breaker_stats: self.circuit_breaker.get_stats(),
             is_shutdown: self.shutdown_signal.load(Ordering::Acquire),
-        }
+        };
     }
 
     /// Check if the task manager is healthy
     pub fn is_healthy(&self) -> bool {
-        return (self.shutdown_signal.load(Ordering::Acquire) == false)
-            && (self.circuit_breaker.is_healthy() == true)
-            && (self.active_tasks.load(Ordering::Acquire) < self.max_concurrent_tasks);
+        return (self.shutdown_signal.load(Ordering::Acquire) == false) && (self.circuit_breaker.is_healthy() == true) && (self.active_tasks.load(Ordering::Acquire) < self.max_concurrent_tasks);
     }
 }
 
@@ -1676,12 +1478,7 @@ impl AllocationStrategy {
         match (size_bytes, is_temporary) {
             (s, _) if s < 1024 * 1024 => Self::Pooled,
             (s, true) if 16 * 1024 * 1024 < s => Self::Direct,
-            (s, _)
-                if 64 * 1024 * 1024 < s
-                    && usage.contains(BufferUsages::MAP_READ | BufferUsages::MAP_WRITE) =>
-            {
-                Self::Streaming
-            }
+            (s, _) if 64 * 1024 * 1024 < s && usage.contains(BufferUsages::MAP_READ | BufferUsages::MAP_WRITE) => Self::Streaming,
 
             _ => Self::Lazy,
         }
@@ -1715,17 +1512,8 @@ pub struct BufferInfo {
 }
 
 impl BufferInfo {
-    pub fn new(
-        buffer: Buffer,
-        size: usize,
-        usage: BufferUsages,
-        strategy: AllocationStrategy,
-        is_pooled: bool,
-    ) -> Self {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+    pub fn new(buffer: Buffer, size: usize, usage: BufferUsages, strategy: AllocationStrategy, is_pooled: bool) -> Self {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
 
         return Self {
             buffer: Arc::new(buffer),
@@ -1740,10 +1528,7 @@ impl BufferInfo {
     }
 
     pub fn touch(&self) {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
 
         self.last_used.store(now, Ordering::Relaxed);
     }
@@ -1753,10 +1538,7 @@ impl BufferInfo {
     }
 
     pub fn seconds_since_last_use(&self) -> u64 {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
         let last_used = self.last_used.load(Ordering::Relaxed);
 
         return now.saturating_sub(last_used);
@@ -1851,9 +1633,7 @@ impl BufferPool {
     pub fn try_get_buffer(&mut self, requested_size: usize) -> Option<BufferId> {
         let size_tolerance = self.size_class / 4;
 
-        if (requested_size < self.size_class.saturating_sub(size_tolerance))
-            || (self.size_class + size_tolerance < requested_size)
-        {
+        if (requested_size < self.size_class.saturating_sub(size_tolerance)) || (self.size_class + size_tolerance < requested_size) {
             return None;
         }
 
@@ -1928,13 +1708,7 @@ pub struct GpuMemoryManager {
 }
 
 impl GpuMemoryManager {
-    pub fn new(
-        device: Arc<Device>,
-        queue: Arc<Queue>,
-        resource_tracker: Arc<ResourceTracker>,
-        allocation_strategy: AllocationStrategy,
-        max_memory_mb: usize,
-    ) -> Self {
+    pub fn new(device: Arc<Device>, queue: Arc<Queue>, resource_tracker: Arc<ResourceTracker>, allocation_strategy: AllocationStrategy, max_memory_mb: usize) -> Self {
         let (cleanup_sender, cleanup_receiver) = mpsc::unbounded_channel();
         let mut pools = Vec::new();
 
@@ -1945,14 +1719,10 @@ impl GpuMemoryManager {
             1024 * 1024,      // 1MB - large buffers
             16 * 1024 * 1024, // 16MB - very large buffers
         ] {
-            pools.push(BufferPool::new(
-                size_class,
-                BufferUsages::STORAGE | BufferUsages::COPY_DST | BufferUsages::COPY_SRC,
-                8,
-            ));
+            pools.push(BufferPool::new(size_class, BufferUsages::STORAGE | BufferUsages::COPY_DST | BufferUsages::COPY_SRC, 8));
         }
 
-        Self {
+        return Self {
             device,
             queue,
             resource_tracker,
@@ -1969,7 +1739,7 @@ impl GpuMemoryManager {
             total_deallocations: AtomicUsize::new(0),
             cleanup_runs: AtomicUsize::new(0),
             emergency_cleanups: AtomicUsize::new(0),
-        }
+        };
     }
 
     async fn try_get_from_pool(&self, size_bytes: usize, usage: BufferUsages) -> Option<BufferId> {
@@ -2003,13 +1773,7 @@ impl GpuMemoryManager {
     }
 
     /// Allocate a new GPU buffer with the specified parameters
-    pub async fn allocate_buffer(
-        &self,
-        size_bytes: usize,
-        usage: BufferUsages,
-        label: Option<&str>,
-        strategy_override: Option<AllocationStrategy>,
-    ) -> Result<BufferId, GpuError> {
+    pub async fn allocate_buffer(&self, size_bytes: usize, usage: BufferUsages, label: Option<&str>, strategy_override: Option<AllocationStrategy>) -> Result<BufferId, GpuError> {
         let current_usage = self.memory_usage.load(Ordering::Acquire);
 
         if self.max_memory_bytes < current_usage + size_bytes {
@@ -2025,8 +1789,7 @@ impl GpuMemoryManager {
             }
         }
 
-        let strategy = strategy_override
-            .unwrap_or_else(|| AllocationStrategy::choose_for_usage(size_bytes, usage, false));
+        let strategy = strategy_override.unwrap_or_else(|| AllocationStrategy::choose_for_usage(size_bytes, usage, false));
 
         if matches!(strategy, AllocationStrategy::Pooled) {
             if let Some(buffer_id) = self.try_get_from_pool(size_bytes, usage).await {
@@ -2043,30 +1806,20 @@ impl GpuMemoryManager {
 
         let buffer_id = next_buffer_id();
         let is_pooled = matches!(strategy, AllocationStrategy::Pooled);
-
         let buffer_info = BufferInfo::new(buffer, size_bytes, usage, strategy, is_pooled);
 
-        // Update memory tracking
         self.memory_usage.fetch_add(size_bytes, Ordering::Relaxed);
+
         let new_usage = self.memory_usage.load(Ordering::Relaxed);
 
-        // Update peak usage
         loop {
             let current_peak = self.peak_usage.load(Ordering::Relaxed);
+
             if new_usage <= current_peak {
                 break;
             }
 
-            if self
-                .peak_usage
-                .compare_exchange_weak(
-                    current_peak,
-                    new_usage,
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
-                )
-                .is_ok()
-            {
+            if self.peak_usage.compare_exchange_weak(current_peak, new_usage, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
                 break;
             }
         }
@@ -2081,6 +1834,7 @@ impl GpuMemoryManager {
     pub fn get_buffer(&self, buffer_id: BufferId) -> Option<Arc<Buffer>> {
         self.allocated_buffers.get(&buffer_id).map(|entry| {
             let buffer_info = entry.value();
+
             buffer_info.touch();
             buffer_info.increment_ref();
             buffer_info.buffer.clone()
@@ -2143,8 +1897,7 @@ impl GpuMemoryManager {
             debug!(buffer_id = ?buffer_id, "Buffer returned to pool for reuse");
         } else {
             if let Some((_, buffer_info)) = self.allocated_buffers.remove(&buffer_id) {
-                self.memory_usage
-                    .fetch_sub(buffer_info.size, Ordering::Relaxed);
+                self.memory_usage.fetch_sub(buffer_info.size, Ordering::Relaxed);
                 self.total_deallocations.fetch_add(1, Ordering::Relaxed);
 
                 debug!(
@@ -2196,7 +1949,7 @@ impl GpuMemoryManager {
             cleaned += 1;
         }
 
-        if cleaned > 0 {
+        if 0 < cleaned {
             let duration = start.elapsed();
 
             info!(
@@ -2262,6 +2015,7 @@ impl GpuMemoryManager {
         }
 
         let duration = start.elapsed();
+
         error!(
             cleaned_buffers = cleaned,
             cleanup_duration_ms = duration.as_millis(),
@@ -2288,19 +2042,19 @@ impl GpuMemoryManager {
 
             strategy_counts[strategy_index] += 1;
 
-            if buffer_info.is_pooled {
+            if buffer_info.is_pooled == true {
                 pooled_count += 1;
             }
         }
 
-        MemoryStats {
+        return MemoryStats {
             total_allocated_bytes: self.memory_usage.load(Ordering::Relaxed),
             peak_usage_bytes: self.peak_usage.load(Ordering::Relaxed),
             active_buffers: self.allocated_buffers.len(),
             pooled_buffers: pooled_count,
             cleanup_queue_length: 0,
             allocation_strategy_counts: strategy_counts,
-        }
+        };
     }
 
     /// Force cleanup of all buffers (for shutdown)
@@ -2319,11 +2073,7 @@ impl GpuMemoryManager {
 
         drop(pools);
 
-        let buffer_ids: Vec<BufferId> = self
-            .allocated_buffers
-            .iter()
-            .map(|entry| *entry.key())
-            .collect();
+        let buffer_ids: Vec<BufferId> = self.allocated_buffers.iter().map(|entry| *entry.key()).collect();
 
         for buffer_id in buffer_ids {
             if let Some((_, _)) = self.allocated_buffers.remove(&buffer_id) {}
@@ -2354,12 +2104,126 @@ pub struct GpuMetrics {
     last_heartbeat: AtomicU64,
 }
 
-#[derive(Debug)]
-pub struct QueueDepthSample {
-    pub timestamp: Instant,
-    pub depth: usize,
-    pub pending_operations: usize,
-    pub memory_usage_mb: usize,
+impl GpuMetrics {
+    pub fn new() -> Self {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+
+        return Self {
+            operations_completed: AtomicU64::new(0),
+            operations_failed: AtomicU64::new(0),
+            average_latency_ms: AtomicU64::new(0),
+            memory_usage_mb: AtomicUsize::new(0),
+            queue_depth: AtomicUsize::new(0),
+            last_heartbeat: AtomicU64::new(now),
+        };
+    }
+
+    fn update_average_latency(&self, new_duration: Duration) {
+        let new_latency_ms = new_duration.as_millis() as u64;
+        let current_avg = self.average_latency_ms.load(Ordering::Relaxed);
+        let new_avg;
+
+        if current_avg == 0 {
+            new_avg = new_latency_ms
+        } else {
+            new_avg = ((current_avg as f64 * 0.9) + (new_latency_ms as f64 * 0.1)) as u64
+        };
+
+        self.average_latency_ms.store(new_avg, Ordering::Relaxed);
+    }
+
+    /// Update memory usage
+    fn update_memory_usage(&self, usage_mb: usize) {
+        self.memory_usage_mb.store(usage_mb, Ordering::Relaxed);
+    }
+
+    /// Update queue depth
+    fn update_queue_depth(&self, depth: usize) {
+        self.queue_depth.store(depth, Ordering::Relaxed);
+    }
+
+    /// Update heartbeat timestamp
+    pub fn heartbeat(&self) {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+
+        self.last_heartbeat.store(now, Ordering::Relaxed);
+    }
+
+    /// Record a completed operation with its execution time
+    pub fn record_operation_completed(&self, duration: Duration) {
+        self.operations_completed.fetch_add(1, Ordering::Relaxed);
+        self.update_average_latency(duration);
+        self.heartbeat();
+    }
+
+    /// Record a failed operation
+    pub fn record_operation_failed(&self, duration: Duration) {
+        self.operations_failed.fetch_add(1, Ordering::Relaxed);
+        self.update_average_latency(duration);
+        self.heartbeat();
+    }
+
+    /// Get current success rate (0.0 to 1.0)
+    pub fn success_rate(&self) -> f64 {
+        let completed = self.operations_completed.load(Ordering::Relaxed);
+        let failed = self.operations_failed.load(Ordering::Relaxed);
+        let total = completed + failed;
+
+        if total == 0 {
+            return 1.0;
+        } else {
+            return (completed as f64) / (total as f64);
+        }
+    }
+
+    /// Get total operations processed
+    pub fn total_operations(&self) -> u64 {
+        return self.operations_completed.load(Ordering::Relaxed) + self.operations_failed.load(Ordering::Relaxed);
+    }
+
+    /// Get average latency in milliseconds
+    pub fn average_latency_ms(&self) -> u64 {
+        return self.average_latency_ms.load(Ordering::Relaxed);
+    }
+
+    /// Get current memory usage in MB
+    pub fn memory_usage_mb(&self) -> usize {
+        return self.memory_usage_mb.load(Ordering::Relaxed);
+    }
+
+    /// Get current queue depth
+    pub fn queue_depth(&self) -> usize {
+        return self.queue_depth.load(Ordering::Relaxed);
+    }
+
+    /// Check if the system is responsive (heartbeat within last 30 seconds)
+    pub fn is_responsive(&self) -> bool {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+        let last_heartbeat = self.last_heartbeat.load(Ordering::Relaxed);
+        let age_sec = now.saturating_sub(last_heartbeat);
+
+        return age_sec <= 30;
+    }
+
+    /// Get time since last heartbeat in seconds
+    pub fn seconds_since_heartbeat(&self) -> u64 {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+        let last_heartbeat = self.last_heartbeat.load(Ordering::Relaxed);
+
+        return now.saturating_sub(last_heartbeat);
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct PerformanceStats {
+    pub total_operations: u64,
+    pub successful_operations: u64,
+    pub failed_operations: u64,
+    pub success_rate: f64,
+    pub average_compute_time_ms: f64,
+    pub operations_per_second: f64,
+    pub peak_memory_usage_mb: usize,
+    pub average_queue_depth: usize,
 }
 
 #[derive(Debug)]
@@ -2372,10 +2236,474 @@ pub struct PerformanceCounter {
     pub average_queue_depth: AtomicUsize,
 }
 
+impl PerformanceCounter {
+    pub fn new() -> Self {
+        return Self {
+            total_operations: AtomicU64::new(0),
+            successful_operations: AtomicU64::new(0),
+            failed_operations: AtomicU64::new(0),
+            total_compute_time_ms: AtomicU64::new(0),
+            peak_memory_usage_mb: AtomicUsize::new(0),
+            average_queue_depth: AtomicUsize::new(0),
+        };
+    }
+
+    /// Update peak memory usage if current usage is higher
+    pub fn update_peak_memory(&self, current_usage_mb: usize) {
+        loop {
+            let current_peak = self.peak_memory_usage_mb.load(Ordering::Relaxed);
+
+            if current_usage_mb <= current_peak {
+                break;
+            }
+
+            if self.peak_memory_usage_mb.compare_exchange_weak(current_peak, current_usage_mb, Ordering::Relaxed, Ordering::Relaxed).is_ok() == true {
+                break;
+            }
+        }
+    }
+
+    /// Get success rate (0.0 to 1.0)
+    pub fn success_rate(&self) -> f64 {
+        let total = self.total_operations.load(Ordering::Relaxed);
+
+        if total == 0 {
+            return 1.0;
+        } else {
+            let successful = self.successful_operations.load(Ordering::Relaxed);
+
+            return (successful as f64) / (total as f64);
+        }
+    }
+
+    /// Get average compute time per operation in milliseconds
+    pub fn average_compute_time_ms(&self) -> f64 {
+        let total_ops = self.total_operations.load(Ordering::Relaxed);
+        let total_time = self.total_compute_time_ms.load(Ordering::Relaxed);
+
+        if total_ops == 0 {
+            return 0.0;
+        } else {
+            return (total_time as f64) / (total_ops as f64);
+        }
+    }
+
+    /// Get operations per second based on total compute time
+    pub fn operations_per_second(&self) -> f64 {
+        let total_ops = self.total_operations.load(Ordering::Relaxed);
+        let total_time_ms = self.total_compute_time_ms.load(Ordering::Relaxed);
+
+        if total_time_ms == 0 {
+            return 0.0;
+        } else {
+            return (total_ops as f64) / ((total_time_ms as f64) / 1000.0);
+        }
+    }
+
+    pub fn update_queue_depth(&self, current_depth: usize) {
+        let avg_current = self.average_queue_depth.load(Ordering::Relaxed);
+        let avg_new;
+
+        if avg_current == 0 {
+            avg_new = current_depth
+        } else {
+            avg_new = ((avg_current as f64 * 0.9) + (current_depth as f64 * 0.1)) as usize
+        };
+
+        self.average_queue_depth.store(avg_new, Ordering::Relaxed);
+    }
+
+    /// Record a successful operation
+    pub fn record_success(&self, compute_time: Duration) {
+        self.total_operations.fetch_add(1, Ordering::Relaxed);
+        self.successful_operations.fetch_add(1, Ordering::Relaxed);
+        self.total_compute_time_ms.fetch_add(compute_time.as_millis() as u64, Ordering::Relaxed);
+    }
+
+    /// Record a failed operation
+    pub fn record_failed(&self, compute_time: Duration) {
+        self.total_operations.fetch_add(1, Ordering::Relaxed);
+        self.failed_operations.fetch_add(1, Ordering::Relaxed);
+        self.total_compute_time_ms.fetch_add(compute_time.as_millis() as u64, Ordering::Relaxed);
+    }
+
+    pub fn get_stats(&self) -> PerformanceStats {
+        PerformanceStats {
+            total_operations: self.total_operations.load(Ordering::Relaxed),
+            successful_operations: self.successful_operations.load(Ordering::Relaxed),
+            failed_operations: self.failed_operations.load(Ordering::Relaxed),
+            success_rate: self.success_rate(),
+            average_compute_time_ms: self.average_compute_time_ms(),
+            operations_per_second: self.operations_per_second(),
+            peak_memory_usage_mb: self.peak_memory_usage_mb.load(Ordering::Relaxed),
+            average_queue_depth: self.average_queue_depth.load(Ordering::Relaxed),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HealthLevel {
+    Healthy,
+    Warning,
+    Critical,
+    Failing,
+}
+
+#[derive(Debug, Clone)]
+pub struct HealthStatus {
+    pub health_level: HealthLevel,
+    pub is_responsive: bool,
+    pub success_rate: f64,
+    pub average_latency_ms: u64,
+    pub memory_pressure: f64,
+    pub queue_health: QueueHealth,
+    pub issues: Vec<String>,
+    pub recommendations: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DepthTrend {
+    Stable,
+    Increasing,
+    Decreasing,
+    Volatile,
+}
+
+#[derive(Debug, Clone)]
+pub struct QueueHealth {
+    pub current_depth: usize,
+    pub average_depth: usize,
+    pub depth_trend: DepthTrend,
+    pub oldest_sample_age: Duration,
+    pub is_stable: bool,
+}
+
+#[derive(Debug)]
+pub struct QueueDepthSample {
+    pub timestamp: Instant,
+    pub depth: usize,
+    pub pending_operations: usize,
+    pub memory_usage_mb: usize,
+}
+
 pub struct GpuHealthMonitor {
     metrics: GpuMetrics,
     queue_depth_tracker: VecDeque<QueueDepthSample>,
     performance_counter: PerformanceCounter,
+}
+
+impl GpuHealthMonitor {
+    pub fn new(max_queue_samples: usize) -> Self {
+        Self {
+            metrics: GpuMetrics::new(),
+            queue_depth_tracker: VecDeque::with_capacity(max_queue_samples),
+            performance_counter: PerformanceCounter::new(),
+        }
+    }
+
+    /// Create a health monitor with default settings
+    pub fn with_defaults() -> Self {
+        return Self::new(300);
+    }
+
+    /// Record a successful operation
+    pub fn record_operation_success(&self, duration: Duration, memory_usage_mb: usize, queue_depth: usize) {
+        self.metrics.record_operation_completed(duration);
+        self.performance_counter.record_success(duration);
+        self.performance_counter.update_peak_memory(memory_usage_mb);
+        self.performance_counter.update_queue_depth(queue_depth);
+        self.update_metrics(memory_usage_mb, queue_depth);
+    }
+
+    /// Record a failed operation
+    pub fn record_operation_failure(&self, duration: Duration, memory_usage_mb: usize, queue_depth: usize) {
+        self.metrics.record_operation_failed(duration);
+        self.performance_counter.record_failed(duration);
+        self.performance_counter.update_peak_memory(memory_usage_mb);
+        self.performance_counter.update_queue_depth(queue_depth);
+        self.update_metrics(memory_usage_mb, queue_depth);
+    }
+
+    /// Update system metrics
+    fn update_metrics(&self, memory_usage_mb: usize, queue_depth: usize) {
+        self.metrics.update_memory_usage(memory_usage_mb);
+        self.metrics.update_queue_depth(queue_depth);
+    }
+
+    /// Sample current queue depth and system state
+    pub fn sample_queue_depth(&mut self, pending_operations: usize, memory_usage_mb: usize) {
+        let sample = QueueDepthSample {
+            timestamp: Instant::now(),
+            depth: self.metrics.queue_depth(),
+            pending_operations,
+            memory_usage_mb,
+        };
+
+        self.queue_depth_tracker.push_back(sample);
+
+        while self.queue_depth_tracker.len() > 300 {
+            self.queue_depth_tracker.pop_front();
+        }
+    }
+
+    /// Analyze queue depth trend over recent samples
+    fn analyze_queue_trend(&self) -> DepthTrend {
+        if self.queue_depth_tracker.len() < 10 {
+            return DepthTrend::Stable;
+        }
+
+        let sample_count = self.queue_depth_tracker.len().min(30);
+        let half_size = sample_count / 2;
+
+        if half_size == 0 {
+            return DepthTrend::Stable;
+        }
+
+        let recent_samples: Vec<_> = self.queue_depth_tracker.iter().rev().take(30).collect();
+        let first_half: f64 = recent_samples.iter().rev().take(15).map(|s| s.depth as f64).sum::<f64>() / 15.0;
+        let second_half: f64 = recent_samples.iter().take(15).map(|s| s.depth as f64).sum::<f64>() / 15.0;
+        let variance: f64 = recent_samples
+            .iter()
+            .map(|s| {
+                let diff = s.depth as f64 - ((first_half + second_half) / 2.0);
+                diff * diff
+            })
+            .sum::<f64>()
+            / (recent_samples.len() as f64);
+        let std_dev = variance.sqrt();
+        let mean = (first_half + second_half) / 2.0;
+        let coefficient_of_variation = if mean > 0.0 { std_dev / mean } else { 0.0 };
+
+        if 0.5 < coefficient_of_variation {
+            return DepthTrend::Volatile;
+        } else {
+            let diff = second_half - first_half;
+
+            if diff.abs() < 1.0 {
+                return DepthTrend::Stable;
+            } else if diff > 0.0 {
+                return DepthTrend::Increasing;
+            } else {
+                return DepthTrend::Decreasing;
+            }
+        }
+    }
+
+    /// Get queue health assessment
+    pub fn get_queue_health(&self) -> QueueHealth {
+        let current_depth = self.metrics.queue_depth();
+        let average_depth = self.performance_counter.average_queue_depth.load(Ordering::Relaxed);
+        let depth_trend = self.analyze_queue_trend();
+        let oldest_sample_age = self.queue_depth_tracker.front().map(|s| s.timestamp.elapsed()).unwrap_or(Duration::from_secs(0));
+        let is_stable = matches!(depth_trend, DepthTrend::Stable | DepthTrend::Decreasing) && (current_depth < 50); // Arbitrary threshold
+
+        return QueueHealth {
+            current_depth,
+            average_depth,
+            depth_trend,
+            oldest_sample_age,
+            is_stable,
+        };
+    }
+
+    /// Assess overall system health
+    pub fn assess_health(&self) -> HealthStatus {
+        let success_rate = self.metrics.success_rate();
+        let is_responsive = self.metrics.is_responsive();
+        let average_latency_ms = self.metrics.average_latency_ms();
+        let memory_usage_mb = self.metrics.memory_usage_mb();
+        let peak_memory_mb = self.performance_counter.peak_memory_usage_mb.load(Ordering::Relaxed);
+
+        let memory_pressure = if peak_memory_mb > 0 { (memory_usage_mb as f64) / (peak_memory_mb as f64) } else { 0.0 };
+
+        let queue_health = self.get_queue_health();
+        let mut issues = Vec::new();
+        let mut recommendations = Vec::new();
+        let health_level;
+
+        if is_responsive == false {
+            issues.push("System is not responsive (no heartbeat in >30s)".to_string());
+            recommendations.push("Check for hanging operations or deadlocks".to_string());
+
+            health_level = HealthLevel::Failing;
+        } else if success_rate < 0.5 {
+            issues.push(format!("Low success rate: {:.1}%", success_rate * 100.0));
+            recommendations.push("Check circuit breaker status and error logs".to_string());
+
+            health_level = HealthLevel::Critical;
+        } else if success_rate < 0.8 || average_latency_ms > 5000 || memory_pressure > 0.9 {
+            if success_rate < 0.8 {
+                issues.push(format!("Moderate success rate: {:.1}%", success_rate * 100.0));
+            }
+            if average_latency_ms > 5000 {
+                issues.push(format!("High latency: {}ms", average_latency_ms));
+                recommendations.push("Check for resource contention or inefficient shaders".to_string());
+            }
+            if memory_pressure > 0.9 {
+                issues.push(format!("High memory pressure: {:.1}%", memory_pressure * 100.0));
+                recommendations.push("Consider enabling memory cleanup or reducing batch sizes".to_string());
+            }
+
+            health_level = HealthLevel::Critical;
+        } else if success_rate < 0.95 || average_latency_ms > 1000 || memory_pressure > 0.7 {
+            if success_rate < 0.95 {
+                issues.push(format!("Success rate could be better: {:.1}%", success_rate * 100.0));
+            }
+            if average_latency_ms > 1000 {
+                issues.push(format!("Elevated latency: {}ms", average_latency_ms));
+            }
+            if memory_pressure > 0.7 {
+                issues.push(format!("Moderate memory pressure: {:.1}%", memory_pressure * 100.0));
+            }
+
+            health_level = HealthLevel::Warning;
+        } else {
+            health_level = HealthLevel::Healthy;
+        };
+
+        match queue_health.depth_trend {
+            DepthTrend::Increasing => {
+                issues.push("Queue depth is increasing".to_string());
+                recommendations.push("Monitor for potential backlog or resource exhaustion".to_string());
+            }
+            DepthTrend::Volatile => {
+                issues.push("Queue depth is volatile".to_string());
+                recommendations.push("Check for bursty workload patterns or resource contention".to_string());
+            }
+            _ => {}
+        }
+
+        if queue_health.current_depth > 100 {
+            issues.push(format!("High queue depth: {}", queue_health.current_depth));
+            recommendations.push("Consider increasing concurrency limits or reducing task submission rate".to_string());
+        }
+
+        return HealthStatus {
+            health_level,
+            is_responsive,
+            success_rate,
+            average_latency_ms,
+            memory_pressure,
+            queue_health,
+            issues,
+            recommendations,
+        };
+    }
+
+    /// Generate a comprehensive health report
+    pub fn generate_health_report(&self) -> String {
+        let health = self.assess_health();
+        let perf_stats = self.performance_counter.get_stats();
+
+        let mut report = String::new();
+
+        report.push_str(&format!("=== GPU Health Monitor ===\n"));
+        report.push_str(&format!("Overall Health: {:?}\n", health.health_level));
+        report.push_str(&format!("Responsive: {}\n", health.is_responsive));
+        report.push_str(&format!("Success Rate: {:.2}%\n", health.success_rate * 100.0));
+        report.push_str(&format!("Average Latency: {}ms\n", health.average_latency_ms));
+        report.push_str(&format!("Memory Pressure: {:.1}%\n", health.memory_pressure * 100.0));
+        report.push_str(&format!("\n=== Performance Statistics ===\n"));
+        report.push_str(&format!("Total Operations: {}\n", perf_stats.total_operations));
+        report.push_str(&format!("Operations/sec: {:.2}\n", perf_stats.operations_per_second));
+        report.push_str(&format!("Peak Memory: {}MB\n", perf_stats.peak_memory_usage_mb));
+        report.push_str(&format!("\n=== Queue Health ===\n"));
+        report.push_str(&format!("Current Depth: {}\n", health.queue_health.current_depth));
+        report.push_str(&format!("Average Depth: {}\n", health.queue_health.average_depth));
+        report.push_str(&format!("Trend: {:?}\n", health.queue_health.depth_trend));
+        report.push_str(&format!("Stable: {}\n", health.queue_health.is_stable));
+
+        if !health.issues.is_empty() {
+            report.push_str(&format!("\n=== Issues ===\n"));
+            for issue in &health.issues {
+                report.push_str(&format!("• {}\n", issue));
+            }
+        }
+
+        if !health.recommendations.is_empty() {
+            report.push_str(&format!("\n=== Recommendations ===\n"));
+            for rec in &health.recommendations {
+                report.push_str(&format!("• {}\n", rec));
+            }
+        }
+
+        return report;
+    }
+
+    /// Log health status at appropriate log level
+    pub fn log_health_status(&self) {
+        let health = self.assess_health();
+
+        match health.health_level {
+            HealthLevel::Healthy => {
+                debug!(
+                    success_rate = health.success_rate,
+                    latency_ms = health.average_latency_ms,
+                    queue_depth = health.queue_health.current_depth,
+                    "GPU system healthy"
+                );
+            }
+            HealthLevel::Warning => {
+                warn!(
+                    success_rate = health.success_rate,
+                    latency_ms = health.average_latency_ms,
+                    memory_pressure = health.memory_pressure,
+                    issues = health.issues.len(),
+                    "GPU system health warning"
+                );
+            }
+            HealthLevel::Critical => {
+                error!(
+                    success_rate = health.success_rate,
+                    latency_ms = health.average_latency_ms,
+                    memory_pressure = health.memory_pressure,
+                    responsive = health.is_responsive,
+                    issues = ?health.issues,
+                    "GPU system health critical"
+                );
+            }
+            HealthLevel::Failing => {
+                error!(
+                    responsive = health.is_responsive,
+                    heartbeat_age = self.metrics.seconds_since_heartbeat(),
+                    issues = ?health.issues,
+                    "GPU system failing"
+                );
+            }
+        }
+    }
+
+    /// Check if emergency shutdown should be triggered
+    pub fn should_emergency_shutdown(&self) -> bool {
+        let health = self.assess_health();
+
+        match health.health_level {
+            HealthLevel::Failing => {
+                return true;
+            }
+            HealthLevel::Critical => {
+                return (health.is_responsive == false) || (health.success_rate < 0.1) || (500 < health.queue_health.current_depth);
+            }
+            _ => {
+                return false;
+            }
+        }
+    }
+
+    /// Get access to underlying metrics for external monitoring systems
+    pub fn get_metrics(&self) -> &GpuMetrics {
+        return &self.metrics;
+    }
+
+    /// Get access to performance counter for detailed statistics
+    pub fn get_performance_counter(&self) -> &PerformanceCounter {
+        return &self.performance_counter;
+    }
+
+    /// Get recent queue depth samples for analysis
+    pub fn get_recent_queue_samples(&self, count: usize) -> Vec<&QueueDepthSample> {
+        return self.queue_depth_tracker.iter().rev().take(count).collect();
+    }
 }
 
 pub struct GpuContext {
