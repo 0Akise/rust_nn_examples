@@ -526,7 +526,9 @@ mod tests {
     async fn test_operation_success_recording() {
         let monitor = GpuHealthMonitor::with_defaults();
 
-        for i in 1..=5 {
+        monitor.record_operation_success(Duration::from_millis(100), 128, 2);
+
+        for i in 2..=5 {
             let duration = Duration::from_millis(100 * i as u64);
 
             monitor.record_operation_success(duration, 64, i * 2);
@@ -545,7 +547,8 @@ mod tests {
         assert_eq!(perf_stats.successful_operations, 5);
         assert_eq!(perf_stats.failed_operations, 0);
         assert!(perf_stats.operations_per_second > 0.0);
-        assert_eq!(perf_stats.peak_memory_usage_mb, 64);
+        assert_eq!(perf_stats.peak_memory_usage_mb, 128);
+        assert!(health.memory_pressure < 0.9);
     }
 
     #[tokio::test]
@@ -553,8 +556,8 @@ mod tests {
         let monitor = GpuHealthMonitor::with_defaults();
 
         monitor.record_operation_success(Duration::from_millis(100), 64, 1);
-        monitor.record_operation_failure(Duration::from_millis(200), 128, 2);
-        monitor.record_operation_failure(Duration::from_millis(150), 96, 1);
+        monitor.record_operation_failed(Duration::from_millis(200), 128, 2);
+        monitor.record_operation_failed(Duration::from_millis(150), 96, 1);
 
         let health = monitor.assess_health();
 
@@ -575,10 +578,10 @@ mod tests {
     async fn test_queue_depth_sampling() {
         let mut monitor = GpuHealthMonitor::with_defaults();
 
-        for i in 1..=20 {
-            monitor.sample_queue_depth(i * 5, 64);
+        for i in 1..=15 {
+            monitor.sample_queue_depth(i * 3, 64);
 
-            sleep(Duration::from_millis(10)).await;
+            sleep(Duration::from_millis(1)).await;
         }
 
         let queue_health = monitor.get_queue_health();
@@ -589,19 +592,18 @@ mod tests {
         let samples = monitor.get_recent_queue_samples(5);
 
         assert_eq!(samples.len(), 5);
-        assert!(samples[0].pending_operations > samples[4].pending_operations);
+        assert!(samples[4].pending_operations < samples[0].pending_operations);
     }
 
     #[tokio::test]
     async fn test_volatile_queue_trend() {
         let mut monitor = GpuHealthMonitor::with_defaults();
+        let volatile_pattern = [10, 80, 5, 85, 15, 90, 8, 95, 20, 75, 3, 88, 25, 70, 12, 92, 30, 65];
 
-        for i in 0..20 {
-            let depth = if i % 2 == 0 { 100 } else { 10 };
-
+        for &depth in &volatile_pattern {
             monitor.sample_queue_depth(depth, 64);
 
-            sleep(Duration::from_millis(5)).await;
+            sleep(Duration::from_millis(1)).await;
         }
 
         let queue_health = monitor.get_queue_health();
@@ -614,10 +616,10 @@ mod tests {
     async fn test_decreasing_queue_trend() {
         let mut monitor = GpuHealthMonitor::with_defaults();
 
-        for i in (1..=20).rev() {
+        for i in (1..=15).rev() {
             monitor.sample_queue_depth(i * 3, 64);
 
-            sleep(Duration::from_millis(5)).await;
+            sleep(Duration::from_millis(1)).await;
         }
 
         let queue_health = monitor.get_queue_health();
@@ -630,13 +632,13 @@ mod tests {
     async fn test_memory_pressure_assessment() {
         let monitor = GpuHealthMonitor::with_defaults();
 
-        monitor.record_operation_success(Duration::from_millis(100), 100, 1);
         monitor.record_operation_success(Duration::from_millis(100), 200, 1);
-        monitor.record_operation_success(Duration::from_millis(100), 190, 1);
+        monitor.record_operation_success(Duration::from_millis(100), 198, 1);
 
         let health = monitor.assess_health();
 
-        assert!(health.memory_pressure > 0.9);
+        assert!(health.memory_pressure > 0.98);
+        assert_eq!(health.health_level, HealthLevel::Critical);
         assert!(health.issues.iter().any(|issue| issue.contains("High memory pressure")));
     }
 
@@ -660,13 +662,16 @@ mod tests {
     async fn test_warning_level_conditions() {
         let monitor = GpuHealthMonitor::with_defaults();
 
-        for i in 0..100 {
+        monitor.record_operation_success(Duration::from_millis(1500), 200, 1);
+
+        for i in 1..100 {
             let duration = Duration::from_millis(1500);
+            let memory_usage = 180;
 
             if i < 94 {
-                monitor.record_operation_success(duration, 64, 1);
+                monitor.record_operation_success(duration, memory_usage, 1);
             } else {
-                monitor.record_operation_failure(duration, 64, 1);
+                monitor.record_operation_failed(duration, memory_usage, 1);
             }
         }
 
@@ -675,6 +680,7 @@ mod tests {
         assert_eq!(health.health_level, HealthLevel::Warning);
         assert!(health.success_rate < 0.95);
         assert!(health.average_latency_ms > 1000);
+        assert!(health.memory_pressure > 0.85 && health.memory_pressure < 0.98);
         assert!(!health.issues.is_empty());
     }
 
@@ -683,7 +689,7 @@ mod tests {
         let monitor = GpuHealthMonitor::with_defaults();
 
         for _ in 0..10 {
-            monitor.record_operation_failure(Duration::from_millis(100), 64, 1);
+            monitor.record_operation_failed(Duration::from_millis(100), 64, 1);
         }
 
         assert!(monitor.should_emergency_shutdown());
@@ -699,7 +705,7 @@ mod tests {
         let mut monitor = GpuHealthMonitor::with_defaults();
 
         monitor.sample_queue_depth(600, 64);
-        monitor.record_operation_failure(Duration::from_millis(100), 64, 600);
+        monitor.record_operation_failed(Duration::from_millis(100), 64, 600);
 
         let health = monitor.assess_health();
 
@@ -729,7 +735,7 @@ mod tests {
         let monitor = GpuHealthMonitor::with_defaults();
 
         monitor.record_operation_success(Duration::from_millis(250), 128, 5);
-        monitor.record_operation_failure(Duration::from_millis(300), 128, 3);
+        monitor.record_operation_failed(Duration::from_millis(300), 128, 3);
 
         let report = monitor.generate_health_report();
 
@@ -748,6 +754,7 @@ mod tests {
         monitor.record_operation_success(Duration::from_millis(100), 64, 2);
 
         let metrics = monitor.get_metrics();
+
         assert_eq!(metrics.total_operations(), 1);
         assert_eq!(metrics.success_rate(), 1.0);
         assert!(metrics.is_responsive());
@@ -798,7 +805,7 @@ mod tests {
         monitor.log_health_status();
 
         for _ in 0..5 {
-            monitor.record_operation_failure(Duration::from_millis(100), 64, 1);
+            monitor.record_operation_failed(Duration::from_millis(100), 64, 1);
         }
 
         monitor.log_health_status();
@@ -813,10 +820,11 @@ mod tests {
         }
 
         let queue_health = monitor.get_queue_health();
+
         assert_eq!(queue_health.depth_trend, DepthTrend::Stable);
 
-        for _ in 0..15 {
-            monitor.sample_queue_depth(0, 64);
+        for _ in 0..10 {
+            monitor.sample_queue_depth(5, 64);
         }
 
         let queue_health = monitor.get_queue_health();
@@ -827,7 +835,6 @@ mod tests {
     #[tokio::test]
     async fn test_concurrent_health_monitoring() {
         let monitor = Arc::new(GpuHealthMonitor::with_defaults());
-
         let mut handles = Vec::new();
 
         for i in 0..5 {
@@ -838,7 +845,7 @@ mod tests {
                     if j % 2 == 0 {
                         monitor_clone.record_operation_success(duration, 64 + j, i + j);
                     } else {
-                        monitor_clone.record_operation_failure(duration, 64 + j, i + j);
+                        monitor_clone.record_operation_failed(duration, 64 + j, i + j);
                     }
                     sleep(Duration::from_millis(1)).await;
                 }
@@ -872,6 +879,34 @@ mod tests {
         let health = monitor.assess_health();
 
         assert_eq!(health.memory_pressure, 0.5);
+    }
+
+    #[tokio::test]
+    async fn test_moderate_memory_pressure() {
+        let monitor = GpuHealthMonitor::with_defaults();
+
+        monitor.record_operation_success(Duration::from_millis(100), 200, 1);
+        monitor.record_operation_success(Duration::from_millis(100), 185, 1);
+
+        let health = monitor.assess_health();
+
+        assert!(health.memory_pressure > 0.90 && health.memory_pressure <= 0.98);
+        assert_eq!(health.health_level, HealthLevel::Warning);
+        assert!(health.issues.iter().any(|issue| issue.contains("Moderate memory pressure")));
+    }
+
+    #[tokio::test]
+    async fn test_healthy_memory_pressure() {
+        let monitor = GpuHealthMonitor::with_defaults();
+
+        monitor.record_operation_success(Duration::from_millis(100), 200, 1);
+        monitor.record_operation_success(Duration::from_millis(100), 120, 1);
+
+        let health = monitor.assess_health();
+
+        assert!(health.memory_pressure < 0.90);
+        assert_eq!(health.health_level, HealthLevel::Healthy);
+        assert!(health.issues.is_empty() || !health.issues.iter().any(|issue| issue.contains("memory pressure")));
     }
 
     #[tokio::test]

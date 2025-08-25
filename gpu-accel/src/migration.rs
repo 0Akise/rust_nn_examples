@@ -2212,6 +2212,10 @@ impl GpuMetrics {
 
         return now.saturating_sub(last_heartbeat);
     }
+
+    pub fn update_memory_usage_current(&self, usage_mb: usize) {
+        self.memory_usage_mb.store(usage_mb, Ordering::Relaxed);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -2257,7 +2261,7 @@ impl PerformanceCounter {
                 break;
             }
 
-            if self.peak_memory_usage_mb.compare_exchange_weak(current_peak, current_usage_mb, Ordering::Relaxed, Ordering::Relaxed).is_ok() == true {
+            if self.peak_memory_usage_mb.compare_exchange_weak(current_peak, current_usage_mb, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
                 break;
             }
         }
@@ -2414,22 +2418,18 @@ impl GpuHealthMonitor {
         self.performance_counter.record_success(duration);
         self.performance_counter.update_peak_memory(memory_usage_mb);
         self.performance_counter.update_queue_depth(queue_depth);
-        self.update_metrics(memory_usage_mb, queue_depth);
+        self.metrics.memory_usage_mb.store(memory_usage_mb, Ordering::Relaxed);
+        self.metrics.queue_depth.store(queue_depth, Ordering::Relaxed);
     }
 
     /// Record a failed operation
-    pub fn record_operation_failure(&self, duration: Duration, memory_usage_mb: usize, queue_depth: usize) {
+    pub fn record_operation_failed(&self, duration: Duration, memory_usage_mb: usize, queue_depth: usize) {
         self.metrics.record_operation_failed(duration);
         self.performance_counter.record_failed(duration);
         self.performance_counter.update_peak_memory(memory_usage_mb);
         self.performance_counter.update_queue_depth(queue_depth);
-        self.update_metrics(memory_usage_mb, queue_depth);
-    }
-
-    /// Update system metrics
-    fn update_metrics(&self, memory_usage_mb: usize, queue_depth: usize) {
-        self.metrics.update_memory_usage(memory_usage_mb);
-        self.metrics.update_queue_depth(queue_depth);
+        self.metrics.memory_usage_mb.store(memory_usage_mb, Ordering::Relaxed);
+        self.metrics.queue_depth.store(queue_depth, Ordering::Relaxed);
     }
 
     /// Sample current queue depth and system state
@@ -2458,39 +2458,50 @@ impl GpuHealthMonitor {
         }
 
         let sample_count = self.queue_depth_tracker.len().min(30);
-        let half_size = sample_count / 2;
+        let recent_samples: Vec<usize> = self.queue_depth_tracker.iter().rev().take(sample_count).rev().map(|s| s.depth).collect();
 
-        if half_size == 0 {
+        if recent_samples.len() < 10 {
             return DepthTrend::Stable;
         }
 
-        let recent_samples: Vec<_> = self.queue_depth_tracker.iter().rev().take(30).collect();
-        let first_half: f64 = recent_samples.iter().rev().take(15).map(|s| s.depth as f64).sum::<f64>() / 15.0;
-        let second_half: f64 = recent_samples.iter().take(15).map(|s| s.depth as f64).sum::<f64>() / 15.0;
+        let half_size = recent_samples.len() / 2;
+        let older_half = &recent_samples[..half_size];
+        let newer_half = &recent_samples[half_size..];
+        let older_avg: f64 = older_half.iter().map(|&x| x as f64).sum::<f64>() / older_half.len() as f64;
+        let newer_avg: f64 = newer_half.iter().map(|&x| x as f64).sum::<f64>() / newer_half.len() as f64;
+        let overall_mean = (older_avg + newer_avg) / 2.0;
         let variance: f64 = recent_samples
             .iter()
-            .map(|s| {
-                let diff = s.depth as f64 - ((first_half + second_half) / 2.0);
+            .map(|&x| {
+                let diff = x as f64 - overall_mean;
                 diff * diff
             })
             .sum::<f64>()
-            / (recent_samples.len() as f64);
+            / recent_samples.len() as f64;
         let std_dev = variance.sqrt();
-        let mean = (first_half + second_half) / 2.0;
-        let coefficient_of_variation = if mean > 0.0 { std_dev / mean } else { 0.0 };
+        let coefficient_of_variation = if overall_mean > 0.0 { std_dev / overall_mean } else { 0.0 };
 
-        if 0.5 < coefficient_of_variation {
+        if coefficient_of_variation > 1.0 {
             return DepthTrend::Volatile;
-        } else {
-            let diff = second_half - first_half;
+        }
 
-            if diff.abs() < 1.0 {
-                return DepthTrend::Stable;
-            } else if diff > 0.0 {
-                return DepthTrend::Increasing;
-            } else {
-                return DepthTrend::Decreasing;
-            }
+        let trend_diff = newer_avg - older_avg;
+        let relative_change;
+
+        if older_avg > 0.0 {
+            relative_change = trend_diff.abs() / older_avg
+        } else if newer_avg > 0.0 {
+            relative_change = 1.0
+        } else {
+            relative_change = 0.0
+        };
+
+        if relative_change < 0.1 {
+            return DepthTrend::Stable;
+        } else if trend_diff > 0.0 {
+            return DepthTrend::Increasing;
+        } else {
+            return DepthTrend::Decreasing;
         }
     }
 
@@ -2500,7 +2511,12 @@ impl GpuHealthMonitor {
         let average_depth = self.performance_counter.average_queue_depth.load(Ordering::Relaxed);
         let depth_trend = self.analyze_queue_trend();
         let oldest_sample_age = self.queue_depth_tracker.front().map(|s| s.timestamp.elapsed()).unwrap_or(Duration::from_secs(0));
-        let is_stable = matches!(depth_trend, DepthTrend::Stable | DepthTrend::Decreasing) && (current_depth < 50); // Arbitrary threshold
+        let is_stable = match depth_trend {
+            DepthTrend::Stable => current_depth < 100,
+            DepthTrend::Decreasing => current_depth < 150,
+            DepthTrend::Increasing => current_depth < 50,
+            DepthTrend::Volatile => false,
+        };
 
         return QueueHealth {
             current_depth,
@@ -2518,8 +2534,13 @@ impl GpuHealthMonitor {
         let average_latency_ms = self.metrics.average_latency_ms();
         let memory_usage_mb = self.metrics.memory_usage_mb();
         let peak_memory_mb = self.performance_counter.peak_memory_usage_mb.load(Ordering::Relaxed);
+        let memory_pressure;
 
-        let memory_pressure = if peak_memory_mb > 0 { (memory_usage_mb as f64) / (peak_memory_mb as f64) } else { 0.0 };
+        if peak_memory_mb > 0 {
+            memory_pressure = (memory_usage_mb as f64) / (peak_memory_mb as f64);
+        } else {
+            memory_pressure = 0.0;
+        };
 
         let queue_health = self.get_queue_health();
         let mut issues = Vec::new();
@@ -2529,42 +2550,44 @@ impl GpuHealthMonitor {
         if is_responsive == false {
             issues.push("System is not responsive (no heartbeat in >30s)".to_string());
             recommendations.push("Check for hanging operations or deadlocks".to_string());
-
             health_level = HealthLevel::Failing;
         } else if success_rate < 0.5 {
             issues.push(format!("Low success rate: {:.1}%", success_rate * 100.0));
             recommendations.push("Check circuit breaker status and error logs".to_string());
-
             health_level = HealthLevel::Critical;
-        } else if success_rate < 0.8 || average_latency_ms > 5000 || memory_pressure > 0.9 {
+        } else if success_rate < 0.8 || average_latency_ms > 5000 || memory_pressure > 0.98 {
             if success_rate < 0.8 {
                 issues.push(format!("Moderate success rate: {:.1}%", success_rate * 100.0));
             }
+
             if average_latency_ms > 5000 {
                 issues.push(format!("High latency: {}ms", average_latency_ms));
                 recommendations.push("Check for resource contention or inefficient shaders".to_string());
             }
-            if memory_pressure > 0.9 {
+
+            if memory_pressure > 0.98 {
                 issues.push(format!("High memory pressure: {:.1}%", memory_pressure * 100.0));
                 recommendations.push("Consider enabling memory cleanup or reducing batch sizes".to_string());
             }
 
             health_level = HealthLevel::Critical;
-        } else if success_rate < 0.95 || average_latency_ms > 1000 || memory_pressure > 0.7 {
+        } else if success_rate < 0.95 || average_latency_ms > 1000 || memory_pressure > 0.90 {
             if success_rate < 0.95 {
                 issues.push(format!("Success rate could be better: {:.1}%", success_rate * 100.0));
             }
+
             if average_latency_ms > 1000 {
                 issues.push(format!("Elevated latency: {}ms", average_latency_ms));
             }
-            if memory_pressure > 0.7 {
+
+            if memory_pressure > 0.90 {
                 issues.push(format!("Moderate memory pressure: {:.1}%", memory_pressure * 100.0));
             }
 
             health_level = HealthLevel::Warning;
         } else {
             health_level = HealthLevel::Healthy;
-        };
+        }
 
         match queue_health.depth_trend {
             DepthTrend::Increasing => {
