@@ -2101,7 +2101,7 @@ pub struct GpuMetrics {
     average_latency_ms: AtomicU64,
     memory_usage_mb: AtomicUsize,
     queue_depth: AtomicUsize,
-    last_heartbeat: AtomicU64,
+    pub last_heartbeat: AtomicU64,
 }
 
 impl GpuMetrics {
@@ -2388,8 +2388,9 @@ pub struct QueueDepthSample {
 
 pub struct GpuHealthMonitor {
     metrics: GpuMetrics,
-    queue_depth_tracker: VecDeque<QueueDepthSample>,
+    pub queue_depth_tracker: VecDeque<QueueDepthSample>,
     performance_counter: PerformanceCounter,
+    max_queue_samples: usize,
 }
 
 impl GpuHealthMonitor {
@@ -2398,6 +2399,7 @@ impl GpuHealthMonitor {
             metrics: GpuMetrics::new(),
             queue_depth_tracker: VecDeque::with_capacity(max_queue_samples),
             performance_counter: PerformanceCounter::new(),
+            max_queue_samples,
         }
     }
 
@@ -2432,16 +2434,19 @@ impl GpuHealthMonitor {
 
     /// Sample current queue depth and system state
     pub fn sample_queue_depth(&mut self, pending_operations: usize, memory_usage_mb: usize) {
+        self.metrics.update_queue_depth(pending_operations);
+        self.metrics.update_memory_usage(memory_usage_mb);
+
         let sample = QueueDepthSample {
             timestamp: Instant::now(),
-            depth: self.metrics.queue_depth(),
+            depth: pending_operations,
             pending_operations,
             memory_usage_mb,
         };
 
         self.queue_depth_tracker.push_back(sample);
 
-        while self.queue_depth_tracker.len() > 300 {
+        while self.max_queue_samples < self.queue_depth_tracker.len() {
             self.queue_depth_tracker.pop_front();
         }
     }
